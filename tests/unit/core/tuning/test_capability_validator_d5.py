@@ -101,6 +101,14 @@ class TestRequestedButNotRenderedIsAnError:
         errors, _warnings = _partitioned_config().validate_for_platform_detailed("fabric-warehouse")
         assert any("is not applied at execution" in e for e in errors)
 
+    def test_stripped_constraint_types_error(self) -> None:
+        for platform in ("doris", "databend", "starrocks"):
+            config = UnifiedTuningConfiguration()
+            config.disable_all_constraints()
+            config.unique_constraints.enabled = True
+            errors, _warnings = config.validate_for_platform_detailed(platform)
+            assert any("requested unique_constraints is not applied at execution" in e for e in errors), platform
+
 
 _LIFECYCLE_ROOTS = frozenset(
     {
@@ -132,19 +140,26 @@ _TUNING_READ_NAMES = frozenset(
 
 _STRIP_CALLS = frozenset({"strip_primary_keys", "strip_foreign_keys"})
 
+_TYPE_EVIDENCE_TOKENS = {
+    "partitioning": ("partition",),
+    "sorting": ("sort",),
+    "clustering": ("cluster",),
+    "distribution": ("distribut",),
+    "primary_keys": ("primary_key", "primary key"),
+    "foreign_keys": ("foreign_key", "foreign key"),
+    "unique_constraints": ("unique",),
+    "check_constraints": ("check",),
+    "z_ordering": ("z_order", "zorder"),
+    "liquid_clustering": ("liquid",),
+    "auto_optimize": ("auto_optimize", "autooptimize", "optimize"),
+    "auto_compact": ("auto_compact", "autocompact", "compact"),
+    "bloom_filters": ("bloom",),
+    "materialized_views": ("materialized",),
+}
 
-def _walk_mro_functions(adapter_cls: type) -> dict[str, list[str]]:
-    found: dict[str, list[str]] = {}
-    for klass in type.mro(adapter_cls):
-        if klass is object:
-            continue
-        for name, member in vars(klass).items():
-            if callable(member) and name not in found:
-                try:
-                    found[name] = inspect.getsource(member).splitlines()
-                except (OSError, TypeError):
-                    continue
-    return found
+_CONSTRAINT_TYPES = frozenset({"primary_keys", "foreign_keys", "unique_constraints", "check_constraints"})
+
+_STRIP_KIND = {"primary_keys": "strip_pk", "foreign_keys": "strip_fk"}
 
 
 def _module_functions(adapter_cls: type) -> dict[str, list[ast.FunctionDef]]:
@@ -170,49 +185,101 @@ def _module_functions(adapter_cls: type) -> dict[str, list[ast.FunctionDef]]:
     return found
 
 
-def _reachable_bodies(adapter_cls: type) -> list[ast.FunctionDef]:
-    sources = _walk_mro_functions(adapter_cls)
-    trees: dict[str, ast.FunctionDef] = {}
-    for name, lines in sources.items():
+def _collect_definers(adapter_cls: type) -> tuple[list[type], dict[str, list[tuple[str, ast.FunctionDef]]]]:
+    mro = [klass for klass in type.mro(adapter_cls) if klass is not object]
+    definers: dict[str, list[tuple[str, ast.FunctionDef]]] = {}
+    for klass in mro:
         try:
-            module = ast.parse(textwrap.dedent("".join(line + "\n" for line in lines)))
+            source = inspect.getsource(klass)
+        except (OSError, TypeError):
+            continue
+        try:
+            module = ast.parse(textwrap.dedent(source))
         except SyntaxError:
             continue
         for node in module.body:
-            if isinstance(node, ast.FunctionDef):
-                trees[node.name] = node
-    reached: dict[str, ast.FunctionDef] = {}
-    helpers = _module_functions(adapter_cls)
-    queue = [name for name in _LIFECYCLE_ROOTS if name in trees]
-    counter = 0
-    while queue:
-        name = queue.pop()
-        if name in reached or name not in trees:
+            if isinstance(node, ast.ClassDef) and node.name == klass.__name__:
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        definers.setdefault(item.name, []).append((klass.__name__, item))
+    return mro, definers
+
+
+def _enqueue_callees(
+    node: ast.FunctionDef,
+    class_name: str,
+    definers: dict[str, list[tuple[str, ast.FunctionDef]]],
+    class_index: dict[str, int],
+    mro: list[type],
+    helpers: dict[str, list[ast.FunctionDef]],
+    queue: list[tuple[str, str]],
+) -> None:
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
             continue
-        node = trees[name]
-        reached[name] = node
-        for child in ast.walk(node):
-            if not isinstance(child, ast.Call):
-                continue
-            func = child.func
-            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "self":
-                if func.attr not in reached:
-                    queue.append(func.attr)
-            elif isinstance(func, ast.Name) and func.id in helpers:
-                for helper in helpers[func.id]:
-                    counter += 1
-                    helper_name = f"{func.id}#{counter}"
-                    trees[helper_name] = helper
-                    queue.append(helper_name)
+        func = child.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "self":
+            if func.attr in definers:
+                queue.append((definers[func.attr][0][0], func.attr))
+        elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Call):
+            inner = func.value
+            if isinstance(inner.func, ast.Name) and inner.func.id == "super" and class_name in class_index:
+                position = class_index[class_name]
+                for klass in mro[position + 1 :]:
+                    if any(entry[0] == klass.__name__ for entry in definers.get(func.attr, [])):
+                        queue.append((klass.__name__, func.attr))
+                        break
+        elif isinstance(func, ast.Name) and func.id in helpers:
+            for position, helper in enumerate(helpers[func.id]):
+                queue.append((func.id, f"{helper.name}#{position}"))
+
+
+def _reachable_bodies(adapter_cls: type) -> list[ast.FunctionDef]:
+    mro, definers = _collect_definers(adapter_cls)
+    class_index = {klass.__name__: position for position, klass in enumerate(mro)}
+    helpers = _module_functions(adapter_cls)
+    helper_nodes: dict[tuple[str, str], ast.FunctionDef] = {}
+    for helper_name, nodes in helpers.items():
+        for position, helper in enumerate(nodes):
+            helper_nodes[(helper_name, f"{helper.name}#{position}")] = helper
+    reached: dict[tuple[str, str], ast.FunctionDef] = {}
+    queue: list[tuple[str, str]] = []
+    for name, entries in definers.items():
+        if name in _LIFECYCLE_ROOTS:
+            queue.append((entries[0][0], name))
+    while queue:
+        class_name, name = queue.pop()
+        if (class_name, name) in reached:
+            continue
+        if (class_name, name) in helper_nodes:
+            reached[(class_name, name)] = helper_nodes[(class_name, name)]
+            _enqueue_callees(helper_nodes[(class_name, name)], class_name, definers, class_index, mro, helpers, queue)
+            continue
+        entries = [entry for entry in definers.get(name, []) if entry[0] == class_name]
+        if not entries:
+            continue
+        node = entries[0][1]
+        reached[(class_name, name)] = node
+        _enqueue_callees(node, class_name, definers, class_index, mro, helpers, queue)
     inline: list[ast.FunctionDef] = list(reached.values())
     return inline
 
 
-def _signals(bodies: list[ast.FunctionDef]) -> tuple[bool, bool, bool]:
+def _signals(
+    bodies: list[ast.FunctionDef],
+) -> tuple[bool, bool, bool, bool, bool, bool, list[str]]:
     tuning_read = False
     sql_exec = False
     strips = False
+    ddl_handoff = False
+    strip_pk = False
+    strip_fk = False
+    texts: list[str] = []
     for body in bodies:
+        try:
+            texts.append(ast.unparse(body).lower())
+        except (ValueError, SyntaxError):
+            continue
         for child in ast.walk(body):
             if isinstance(child, ast.Name) and child.id in _TUNING_READ_NAMES:
                 tuning_read = True
@@ -222,10 +289,44 @@ def _signals(bodies: list[ast.FunctionDef]) -> tuple[bool, bool, bool]:
                     sql_exec = True
                 if isinstance(func, ast.Name) and func.id in _STRIP_CALLS:
                     strips = True
+                    if func.id == "strip_primary_keys":
+                        strip_pk = True
+                    else:
+                        strip_fk = True
+                if isinstance(func, ast.Attribute) and func.attr == "sub":
+                    for arg in child.args:
+                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                            if "primary" in arg.value.lower() and "key" in arg.value.lower():
+                                strips = True
+                                strip_pk = True
+                            if "foreign" in arg.value.lower() and "key" in arg.value.lower():
+                                strips = True
+                                strip_fk = True
+                if isinstance(func, ast.Attribute) and func.attr == "get_create_tables_sql":
+                    tuning_read = True
                 for keyword in child.keywords:
                     if keyword.arg == "tuning_config":
                         tuning_read = True
-    return tuning_read, sql_exec, strips
+                        if isinstance(func, ast.Attribute) and func.attr == "get_create_tables_sql":
+                            ddl_handoff = True
+    return tuning_read, sql_exec, strips, ddl_handoff, strip_pk, strip_fk, texts
+
+
+def _type_evidenced(
+    tuning_type_value: str, texts: list[str], ddl_handoff: bool, strip_pk: bool, strip_fk: bool
+) -> bool:
+    tokens = _TYPE_EVIDENCE_TOKENS.get(tuning_type_value, ())
+    if any(token in text for text in texts for token in tokens):
+        return True
+    if tuning_type_value in _CONSTRAINT_TYPES and ddl_handoff:
+        kind = _STRIP_KIND.get(tuning_type_value)
+        if kind is None:
+            return True
+        if kind == "strip_pk" and not strip_pk:
+            return True
+        if kind == "strip_fk" and not strip_fk:
+            return True
+    return False
 
 
 def _adapter_class(platform_key: str) -> type | None:
@@ -431,6 +532,18 @@ _NONE_JUSTIFICATION_OVERRIDES: dict[tuple[str, str], str] = {
     ("doris", "foreign_keys"): "Adapter strips foreign keys from every CREATE TABLE (doris.py:802).",
     ("databend", "foreign_keys"): "Adapter strips foreign keys from every CREATE TABLE (databend/adapter.py:680).",
     ("databend", "primary_keys"): "Adapter strips PRIMARY KEY clauses via inline regex (databend/adapter.py:678).",
+    ("doris", "unique_constraints"): "NoOp adapter; UNIQUE never produced or consumed from tuning.",
+    ("doris", "check_constraints"): "NoOp adapter; CHECK never produced or consumed from tuning.",
+    ("databend", "unique_constraints"): "Only CLUSTERING renders; UNIQUE never produced or consumed from tuning.",
+    ("databend", "check_constraints"): "Only CLUSTERING renders; CHECK never produced or consumed from tuning.",
+    (
+        "starrocks",
+        "unique_constraints",
+    ): "Workload rewrite handles PARTITION/DISTRIBUTION/ORDER BY plus PK-model only (starrocks/workload.py:109-198).",
+    (
+        "starrocks",
+        "check_constraints",
+    ): "Workload rewrite handles PARTITION/DISTRIBUTION/ORDER BY plus PK-model only (starrocks/workload.py:109-198).",
     (
         "mysql",
         "partitioning",
@@ -453,15 +566,17 @@ class TestRegistryExecutionParity:
         assert adapter_cls is not None, f"no adapter class mapped for registry platform '{platform_key}'"
         bodies = _reachable_bodies(adapter_cls)
         assert bodies, f"no lifecycle roots reachable on {adapter_cls.__name__}"
-        tuning_read, sql_exec, _strips = _signals(bodies)
+        tuning_read, sql_exec, _strips, ddl_handoff, strip_pk, strip_fk, texts = _signals(bodies)
         for tuning_type, capability in PLATFORM_TUNING_CAPABILITIES[platform_key].items():
             if is_not_rendered_at_execution(capability):
                 continue
             key = (platform_key, tuning_type.value)
-            assert key in _RENDERED_OVERRIDE_JUSTIFICATIONS or (tuning_read and sql_exec), (
+            evidenced = _type_evidenced(tuning_type.value, texts, ddl_handoff, strip_pk, strip_fk)
+            assert key in _RENDERED_OVERRIDE_JUSTIFICATIONS or ((tuning_read and sql_exec) and evidenced), (
                 f"{platform_key}/{tuning_type.value} is registered '{capability.rendered_via}' "
                 f"({capability.mechanism_id}) but the {adapter_cls.__name__} lifecycle shows "
-                f"tuning_read={tuning_read} sql_exec={sql_exec}; add execution or correct the registry"
+                f"tuning_read={tuning_read} sql_exec={sql_exec} type_evidenced={evidenced}; "
+                f"add execution or correct the registry"
             )
 
     @pytest.mark.parametrize(
@@ -472,7 +587,7 @@ class TestRegistryExecutionParity:
         adapter_cls = _adapter_class(resolve_platform_key(platform_key))
         assert adapter_cls is not None, f"no adapter class mapped for registry platform '{platform_key}'"
         bodies = _reachable_bodies(adapter_cls)
-        _tuning_read, _sql_exec, strips = _signals(bodies)
+        _tuning_read, _sql_exec, strips, _ddl_handoff, _strip_pk, _strip_fk, _texts = _signals(bodies)
         for tuning_type, capability in PLATFORM_TUNING_CAPABILITIES[platform_key].items():
             if not is_not_rendered_at_execution(capability):
                 continue

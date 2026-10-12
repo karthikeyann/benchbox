@@ -85,6 +85,8 @@ class TestDisplayNameValidationNoLongerErrors:
     def test_starrocks_display_name_validates_clean(self):
         config = UnifiedTuningConfiguration()
         config.foreign_keys.enabled = False
+        config.unique_constraints.enabled = False
+        config.check_constraints.enabled = False
         errors, warnings = config.validate_for_platform_detailed("StarRocks")
         assert errors == []
         assert warnings == []
@@ -236,6 +238,8 @@ class TestCanonicalPlatformType:
         adapter = _StubAdapter(display_name="StarRocks", type="starrocks")
         config = UnifiedTuningConfiguration()
         config.foreign_keys.enabled = False
+        config.unique_constraints.enabled = False
+        config.check_constraints.enabled = False
         adapter.unified_tuning_configuration = config
         assert adapter.validate_tuning_configuration_for_platform() == []
         assert adapter.validate_tuning_configuration(config) == []

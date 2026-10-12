@@ -393,6 +393,15 @@ PLATFORM_TUNING_CAPABILITIES: dict[str, dict[TuningType, TuningCapability]] = {
             "DatabendAdapter strips foreign keys from every CREATE TABLE (databend/adapter.py:680); "
             "remaining constraint configuration is informational log-only.",
         ),
+        _T.UNIQUE_CONSTRAINTS: _none(
+            "databend_no_unique_check_rendering",
+            "DatabendAdapter strips PK/FK and only renders CLUSTERING; UNIQUE/CHECK clauses are "
+            "never produced or consumed from tuning.",
+        ),
+        _T.CHECK_CONSTRAINTS: _none(
+            "databend_no_unique_check_rendering",
+            "Same gap as UNIQUE_CONSTRAINTS: never produced or consumed from tuning.",
+        ),
     },
     "datafusion": {
         _T.PRIMARY_KEYS: _none(
@@ -488,8 +497,16 @@ PLATFORM_TUNING_CAPABILITIES: dict[str, dict[TuningType, TuningCapability]] = {
             "starrocks_strips_foreign_keys",
             "StarRocksWorkloadMixin strips foreign keys from every CREATE TABLE (starrocks/workload.py:120).",
         ),
-        _T.UNIQUE_CONSTRAINTS: _ddl(_INLINE_CONSTRAINT, _CONSTRAINT_NOTE),
-        _T.CHECK_CONSTRAINTS: _ddl(_INLINE_CONSTRAINT, _CONSTRAINT_NOTE),
+        _T.UNIQUE_CONSTRAINTS: _none(
+            "starrocks_no_unique_check_rendering",
+            "StarRocksWorkloadMixin._optimize_table_definition handles PARTITION/DISTRIBUTION/"
+            "ORDER BY plus PK-model selection and foreign-key stripping only (starrocks/workload.py:"
+            "109-198); nothing renders, strips, or validates UNIQUE/CHECK clauses.",
+        ),
+        _T.CHECK_CONSTRAINTS: _none(
+            "starrocks_no_unique_check_rendering",
+            "Same gap as UNIQUE_CONSTRAINTS: no UNIQUE/CHECK handling in the workload rewrite.",
+        ),
     },
     "doris": {
         _T.PARTITIONING: _none(
@@ -514,6 +531,15 @@ PLATFORM_TUNING_CAPABILITIES: dict[str, dict[TuningType, TuningCapability]] = {
         _T.FOREIGN_KEYS: _none(
             "doris_strips_foreign_keys",
             "DorisAdapter strips foreign keys from every CREATE TABLE (doris.py:802).",
+        ),
+        _T.UNIQUE_CONSTRAINTS: _none(
+            "doris_no_unique_check_rendering",
+            "DorisAdapter renders nothing at execution (NoOpTableTuningMixin) and strips PK/FK; "
+            "UNIQUE/CHECK clauses are never produced or consumed from tuning.",
+        ),
+        _T.CHECK_CONSTRAINTS: _none(
+            "doris_no_unique_check_rendering",
+            "Same gap as UNIQUE_CONSTRAINTS: never produced or consumed from tuning.",
         ),
     },
     "trino": {
