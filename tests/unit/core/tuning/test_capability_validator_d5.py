@@ -430,6 +430,7 @@ _NONE_JUSTIFICATION_OVERRIDES: dict[tuple[str, str], str] = {
     ("doris", "primary_keys"): "Adapter strips PRIMARY KEY clauses from every CREATE TABLE (doris.py:803-805).",
     ("doris", "foreign_keys"): "Adapter strips foreign keys from every CREATE TABLE (doris.py:802).",
     ("databend", "foreign_keys"): "Adapter strips foreign keys from every CREATE TABLE (databend/adapter.py:680).",
+    ("databend", "primary_keys"): "Adapter strips PRIMARY KEY clauses via inline regex (databend/adapter.py:678).",
     (
         "mysql",
         "partitioning",

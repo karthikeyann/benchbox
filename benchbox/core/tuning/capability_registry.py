@@ -382,10 +382,11 @@ PLATFORM_TUNING_CAPABILITIES: dict[str, dict[TuningType, TuningCapability]] = {
             "Same gap as PARTITIONING: only CLUSTERING is rendered at execution.",
         ),
         _T.MATERIALIZED_VIEWS: _none("unimplemented", "Compatible per the legacy map; no adapter implementation."),
-        _T.PRIMARY_KEYS: _ddl(
-            _INLINE_CONSTRAINT,
-            "Tuned primary keys flow through the shared tuning-aware DDL path "
-            "(databend/adapter.py:257); only foreign keys are stripped (databend/adapter.py:680).",
+        _T.PRIMARY_KEYS: _none(
+            "databend_strips_primary_keys",
+            "DatabendAdapter strips PRIMARY KEY clauses from every executed CREATE TABLE via "
+            "inline regex (databend/adapter.py:678), alongside the foreign-key strip. Tuned keys "
+            "reach the DDL builder but never reach the engine.",
         ),
         _T.FOREIGN_KEYS: _none(
             "databend_strips_foreign_keys",
@@ -477,7 +478,18 @@ PLATFORM_TUNING_CAPABILITIES: dict[str, dict[TuningType, TuningCapability]] = {
             "tables -- byte-identical to the previous bespoke injection (BUCKETS 8). Preview and "
             "execution render through the same generator.",
         ),
-        **_constraint_entries(),
+        _T.PRIMARY_KEYS: _ddl(
+            _INLINE_CONSTRAINT,
+            "Tuned primary keys choose the StarRocks key model: the workload rewrite reads the "
+            "PK columns from the tuned DDL and emits PRIMARY KEY when they lead the table, else "
+            "DUPLICATE KEY (starrocks/workload.py:122-152).",
+        ),
+        _T.FOREIGN_KEYS: _none(
+            "starrocks_strips_foreign_keys",
+            "StarRocksWorkloadMixin strips foreign keys from every CREATE TABLE (starrocks/workload.py:120).",
+        ),
+        _T.UNIQUE_CONSTRAINTS: _ddl(_INLINE_CONSTRAINT, _CONSTRAINT_NOTE),
+        _T.CHECK_CONSTRAINTS: _ddl(_INLINE_CONSTRAINT, _CONSTRAINT_NOTE),
     },
     "doris": {
         _T.PARTITIONING: _none(
