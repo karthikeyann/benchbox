@@ -84,6 +84,7 @@ class TestDisplayNameValidationNoLongerErrors:
 
     def test_starrocks_display_name_validates_clean(self):
         config = UnifiedTuningConfiguration()
+        config.foreign_keys.enabled = False
         errors, warnings = config.validate_for_platform_detailed("StarRocks")
         assert errors == []
         assert warnings == []
@@ -233,9 +234,11 @@ class TestCanonicalPlatformType:
 
     def test_validate_tuning_configuration_uses_canonical_key(self):
         adapter = _StubAdapter(display_name="StarRocks", type="starrocks")
-        adapter.unified_tuning_configuration = UnifiedTuningConfiguration()
+        config = UnifiedTuningConfiguration()
+        config.foreign_keys.enabled = False
+        adapter.unified_tuning_configuration = config
         assert adapter.validate_tuning_configuration_for_platform() == []
-        assert adapter.validate_tuning_configuration(UnifiedTuningConfiguration()) == []
+        assert adapter.validate_tuning_configuration(config) == []
 
 
 class _MetadataStubAdapter:
