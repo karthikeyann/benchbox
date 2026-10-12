@@ -730,20 +730,27 @@ def _match_object(intent: _Intent, state: IntrospectedState) -> tuple[str, Intro
 
 
 def _attested_sort_columns(statement_text: str) -> tuple[str, ...]:
-    order = _ORDER_BY_RE.search(statement_text)
-    if order:
-        return normalize_columns(order.group("cols"))
-    keyword = _ORDER_BY_KEYWORD_RE.search(statement_text)
-    if keyword is None:
-        return ()
-    tail = statement_text[keyword.end() :]
-    columns: list[str] = []
-    for chunk in tail.split(","):
-        token = re.sub(r"(?i)\b(asc|desc|nulls\s+first|nulls\s+last)\b", " ", chunk).strip()
-        token = token.strip().strip(";")
-        if token:
-            columns.append(token)
-    return normalize_columns(columns)
+    from benchbox.core.tuning.applied_ledger import _split_sql_script
+
+    segments = [segment for segment in _split_sql_script(statement_text) if segment.strip()]
+    for segment in segments:
+        order = _ORDER_BY_RE.search(segment)
+        if order:
+            return normalize_columns(order.group("cols"))
+    for segment in segments:
+        keyword = _ORDER_BY_KEYWORD_RE.search(segment)
+        if keyword is None:
+            continue
+        tail = segment[keyword.end() :]
+        columns: list[str] = []
+        for chunk in tail.split(","):
+            token = re.sub(r"(?i)\b(asc|desc|nulls\s+first|nulls\s+last)\b", " ", chunk).strip()
+            token = token.strip().strip(";")
+            if token:
+                columns.append(token)
+        if columns:
+            return normalize_columns(columns)
+    return ()
 
 
 def corroborate(ledger: AppliedTuningLedger, introspected_state: IntrospectedState | None) -> IntrospectionReceipt:

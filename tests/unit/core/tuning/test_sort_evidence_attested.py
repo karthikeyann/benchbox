@@ -174,3 +174,17 @@ class TestCtasSortRecordsLedgerStatement:
         ]
         assert len(recorded) == 1
         assert recorded[0].table == "lineitem"
+        post_load_executed = [
+            statement
+            for statement in adapter._applied_tuning_ledger.statements
+            if statement.phase == PHASE_POST_LOAD and statement.status == "executed"
+        ]
+        assert len(post_load_executed) == 1
+
+        from benchbox.core.tuning.introspection import ATTESTED, IntrospectedState, corroborate
+
+        receipt = corroborate(adapter._applied_tuning_ledger, IntrospectedState(platform="duckdb", objects=[]))
+        assert [entry.verdict for entry in receipt.entries] == [ATTESTED]
+        assert receipt.entries[0].reason == "physical sort executed; no catalog footprint"
+        assert list(receipt.entries[0].expected_columns) == ["l_shipdate"]
+        assert receipt.corroborated is False
