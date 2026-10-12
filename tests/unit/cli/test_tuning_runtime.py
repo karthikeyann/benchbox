@@ -69,6 +69,15 @@ def test_default_unified_config_disables_check_constraints_on_duckdb(platform: s
     assert config.unique_constraints.enabled is True
 
 
-@pytest.mark.parametrize("platform", [None, "motherduck", "postgresql", "snowflake"])
+@pytest.mark.parametrize("platform", [None, "postgresql", "snowflake"])
 def test_default_unified_config_keeps_check_constraints_elsewhere(platform: str | None) -> None:
     assert build_default_unified_config(platform).to_dict() == UnifiedTuningConfiguration().to_dict()
+
+
+def test_default_unified_config_disables_unrendered_constraints_on_motherduck() -> None:
+    config = build_default_unified_config("motherduck")
+
+    assert config.primary_keys.enabled is False
+    assert config.foreign_keys.enabled is False
+    assert config.unique_constraints.enabled is False
+    assert config.check_constraints.enabled is False

@@ -266,7 +266,8 @@ class TestEvidence:
 
         assert ledger.dropped == []
         assert [(item.intent, item.satisfied_by) for item in ledger.satisfied] == [
-            ("distribution:LINEITEM (L_ORDERKEY)", 0)
+            ("distribution:LINEITEM (L_ORDERKEY)", 0),
+            ("primary_keys", 1),
         ]
 
     def test_property_style_columns_inside_literals_are_evidence(self):
@@ -609,10 +610,15 @@ class TestDeclaredConstraints:
             declared_constraints=frozenset({TuningType.PRIMARY_KEYS, TuningType.FOREIGN_KEYS}),
         )
 
-        assert {item.intent: item.reason for item in ledger.dropped} == {
-            "primary_keys": NOT_RENDERED_REASON,
-            "foreign_keys": NOT_RENDERED_REASON,
-        }
+        expected_reasons = {
+            "datafusion": {
+                "primary_keys": "DataFusionAdapter builds its schema explicitly without constraints "
+                "even when enabled (datafusion.py:558-564).",
+                "foreign_keys": "Same as PRIMARY_KEYS: schema is created without constraints.",
+            },
+        }.get(platform, {"primary_keys": NOT_RENDERED_REASON, "foreign_keys": NOT_RENDERED_REASON})
+
+        assert {item.intent: item.reason for item in ledger.dropped} == expected_reasons
 
     def test_unknown_declarations_reconcile_every_enabled_toggle(self):
         ledger = AppliedTuningLedger()

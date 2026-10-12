@@ -184,6 +184,14 @@ def test_registry_has_platforms_interface_deliberately_excludes():
         "questdb",
         "pg-duckdb",
         "pg-mooncake",
+        "cedardb",
+        "citus",
+        "paradedb",
+        "singlestore",
+        "databend",
+        "datafusion",
+        "motherduck",
+        "fabric-warehouse",
     }
 
 

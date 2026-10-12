@@ -221,8 +221,9 @@ class TestFamilies:
         adapter._reconcile_requested_tuning(config)
 
         assert _drops(adapter) == {
-            "primary_keys": NOT_RENDERED_REASON,
-            "foreign_keys": NOT_RENDERED_REASON,
+            "primary_keys": "DataFusionAdapter builds its schema explicitly without constraints "
+            "even when enabled (datafusion.py:558-564).",
+            "foreign_keys": "Same as PRIMARY_KEYS: schema is created without constraints.",
         }
         assert adapter._applied_tuning_ledger.statements == []
         assert _status(adapter) == NOOP
@@ -325,7 +326,10 @@ class TestSeam:
 
         adapter._reconcile_requested_tuning(UnifiedTuningConfiguration())
 
-        assert _drops(adapter) == {"primary_keys": NOT_RENDERED_REASON}
+        assert _drops(adapter) == {
+            "primary_keys": "DataFusionAdapter builds its schema explicitly without constraints "
+            "even when enabled (datafusion.py:558-564)."
+        }
 
     def test_reconciliation_error_fails_closed_with_a_blocking_drop(self, monkeypatch):
         adapter = self._adapter()

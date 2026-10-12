@@ -13,7 +13,7 @@ from benchbox.core.tuning.applied_ledger import (
     AppliedStatement,
     AppliedTuningLedger,
 )
-from benchbox.core.tuning.capability_registry import TuningCapability, get_capability
+from benchbox.core.tuning.capability_registry import TuningCapability, get_capability, is_not_rendered_at_execution
 from benchbox.core.tuning.interface import TuningType, UnifiedTuningConfiguration
 from benchbox.core.tuning.introspection import normalize_identifier, statement_index_columns, statement_table
 
@@ -234,7 +234,7 @@ def _realized_in_ddl(capability: TuningCapability | None, statement: AppliedStat
 def _drop_reason(capability: TuningCapability | None) -> str:
     if capability is None:
         return NOT_RENDERED_REASON
-    if capability.rendered_via == "none" or ":preview_only" in capability.mechanism_id:
+    if is_not_rendered_at_execution(capability):
         return capability.notes or f"not rendered at execution ({capability.mechanism_id})"
     return NOT_RENDERED_REASON
 
