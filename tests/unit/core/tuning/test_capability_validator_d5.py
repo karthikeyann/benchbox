@@ -495,6 +495,10 @@ _NONE_JUSTIFICATION_OVERRIDES: dict[tuple[str, str], str] = {
         "databend",
         "distribution",
     ): "Only CLUSTERING is rendered; generate/apply ignore other types (databend/adapter.py:612-651).",
+    (
+        "databend",
+        "materialized_views",
+    ): "Only CLUSTERING is rendered; materialized views never produced or consumed from tuning.",
     ("redshift", "partitioning"): "No CREATE TABLE partition clause; recreation never happens (redshift.py:2512-2636).",
     ("redshift", "distribution"): "Recreation never happens; maintenance only (redshift.py:2607-2624).",
     ("bigquery", "partitioning"): "Recreation hint only; table never re-created (bigquery.py:2013-2027).",
@@ -587,12 +591,15 @@ class TestRegistryExecutionParity:
         adapter_cls = _adapter_class(resolve_platform_key(platform_key))
         assert adapter_cls is not None, f"no adapter class mapped for registry platform '{platform_key}'"
         bodies = _reachable_bodies(adapter_cls)
-        _tuning_read, _sql_exec, strips, _ddl_handoff, _strip_pk, _strip_fk, _texts = _signals(bodies)
+        _tuning_read, _sql_exec, _strips, _ddl_handoff, strip_pk, strip_fk, _texts = _signals(bodies)
         for tuning_type, capability in PLATFORM_TUNING_CAPABILITIES[platform_key].items():
             if not is_not_rendered_at_execution(capability):
                 continue
             key = (platform_key, tuning_type.value)
-            assert strips or key in _NONE_JUSTIFICATION_OVERRIDES, (
+            kind_stripped = (tuning_type.value == "primary_keys" and strip_pk) or (
+                tuning_type.value == "foreign_keys" and strip_fk
+            )
+            assert kind_stripped or key in _NONE_JUSTIFICATION_OVERRIDES, (
                 f"{platform_key}/{tuning_type.value} is registered not-rendered but the "
                 f"{adapter_cls.__name__} lifecycle shows no strip and no documented justification; "
                 f"document it in _NONE_JUSTIFICATION_OVERRIDES or correct the registry"
