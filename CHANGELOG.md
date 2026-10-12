@@ -291,6 +291,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mismatched keys are recorded as failed ledger statements and warned. Result
   metadata reports the live tuned values for shuffle partitions and adaptive
   execution.
+- A successful physical sort rewrite (CTAS or constraint-preserving in-place sort)
+  is recorded as an executed post-load ledger statement and shown in the run
+  receipt as attested (`Recorded; not catalog-checkable`). Attested evidence never
+  satisfies catalog-verifiable intents and never promotes a run to verified on
+  its own.
 - The Atom feed uses canonical `/blog/` self and entry links while retaining stable entry IDs for existing subscribers.
 - Deprecated option aliases now show their warning. The Polars `streaming`
   option, `--polars-streaming`, Dask `use_distributed`, pg-duckdb

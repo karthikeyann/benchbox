@@ -27,6 +27,7 @@ MISMATCH = "mismatch"
 TRANSIENT = "transient"
 MAINTENANCE = "maintenance"
 UNVERIFIABLE = "unverifiable"
+ATTESTED = "attested"
 
 _VERIFIABLE_VERDICTS = frozenset({CORROBORATED, ABSENT, MISMATCH, UNVERIFIABLE})
 
@@ -728,6 +729,23 @@ def _match_object(intent: _Intent, state: IntrospectedState) -> tuple[str, Intro
     return MISMATCH, named or same_table[0]
 
 
+def _attested_sort_columns(statement_text: str) -> tuple[str, ...]:
+    order = _ORDER_BY_RE.search(statement_text)
+    if order:
+        return normalize_columns(order.group("cols"))
+    keyword = _ORDER_BY_KEYWORD_RE.search(statement_text)
+    if keyword is None:
+        return ()
+    tail = statement_text[keyword.end() :]
+    columns: list[str] = []
+    for chunk in tail.split(","):
+        token = re.sub(r"(?i)\b(asc|desc|nulls\s+first|nulls\s+last)\b", " ", chunk).strip()
+        token = token.strip().strip(";")
+        if token:
+            columns.append(token)
+    return normalize_columns(columns)
+
+
 def corroborate(ledger: AppliedTuningLedger, introspected_state: IntrospectedState | None) -> IntrospectionReceipt:
     platform = introspected_state.platform if introspected_state else "unknown"
     state_error = None
@@ -754,6 +772,20 @@ def corroborate(ledger: AppliedTuningLedger, introspected_state: IntrospectedSta
                     verdict=TRANSIENT if is_session_failure else UNVERIFIABLE,
                     table=stmt.table,
                     reason=reason,
+                )
+            )
+            continue
+
+        if stmt.phase == PHASE_POST_LOAD and stmt.mechanism == "sorted_ingestion":
+            entries.append(
+                ReceiptEntry(
+                    statement=stmt.statement,
+                    phase=stmt.phase,
+                    verdict=ATTESTED,
+                    kind=KIND_SORT_KEY,
+                    table=stmt.table,
+                    expected_columns=_attested_sort_columns(str(stmt.statement or "")),
+                    reason="physical sort executed; no catalog footprint",
                 )
             )
             continue
@@ -857,6 +889,7 @@ def corroborate(ledger: AppliedTuningLedger, introspected_state: IntrospectedSta
 
 __all__ = [
     "ABSENT",
+    "ATTESTED",
     "CONSTRAINT_FOREIGN_KEY",
     "CONSTRAINT_PRIMARY_KEY",
     "CONSTRAINT_UNIQUE",

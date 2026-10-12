@@ -285,6 +285,31 @@ class SortedIngestionMixin:
             raise
         self._sorted_ingestion_applied_tables.append(validated_table)
         self._sorted_ingestion_total_apply_seconds += elapsed_seconds(apply_start)
+        ledger = getattr(self, "_applied_tuning_ledger", None)
+        if ledger is not None:
+            from benchbox.core.tuning.applied_ledger import EXECUTED, PHASE_POST_LOAD
+
+            twin = next(
+                (
+                    statement
+                    for statement in ledger.statements
+                    if statement.status == EXECUTED
+                    and statement.phase == PHASE_POST_LOAD
+                    and statement.mechanism is None
+                    and statement.statement == ledger_statement
+                ),
+                None,
+            )
+            if twin is not None:
+                twin.mechanism = "sorted_ingestion"
+                twin.table = validated_table
+            else:
+                ledger.record(
+                    ledger_statement,
+                    PHASE_POST_LOAD,
+                    mechanism="sorted_ingestion",
+                    table=validated_table,
+                )
         sorted_col_names = ", ".join(column.name for column in sorted_columns)
         self.log_verbose(f"Applied CTAS sorting to {table_name}: {sorted_col_names}")
         return True
