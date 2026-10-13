@@ -558,8 +558,9 @@ describe("RunReceipt applied-tuning receipt drill-down", () => {
     const drilldown = within(region).getByTestId("applied-receipt-drilldown");
     const entries = within(drilldown).getAllByTestId("applied-receipt-entry");
     expect(entries.length).toBe(1);
-    expect(within(entries[0]).getByText("attested — Recorded; not catalog-checkable")).toBeTruthy();
-    expect(within(entries[0]).getByText("physical sort executed; no catalog footprint")).toBeTruthy();
+    const [attested] = entries as [HTMLElement];
+    expect(within(attested).getByText("attested — Recorded; not catalog-checkable")).toBeTruthy();
+    expect(within(attested).getByText("physical sort executed; no catalog footprint")).toBeTruthy();
   });
 
   it("omits fields the receipt did not record rather than inventing them", () => {
