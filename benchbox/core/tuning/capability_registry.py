@@ -117,12 +117,13 @@ PLATFORM_TUNING_CAPABILITIES: dict[str, dict[TuningType, TuningCapability]] = {
         ),
     },
     "databricks": {
-        _T.PARTITIONING: _ddl(
-            "delta_partitioned_by",
-            "Rendered as Delta PARTITIONED BY at CREATE TABLE time via the cloud_spark DDL mixin "
-            "(third renderer per ADR-3; not migrated to core.tuning.generators this round -- Databricks "
-            "migration is explicitly out of scope, owned by the blocked databricks-liquid-clustering "
-            "TODO).",
+        _T.PARTITIONING: _none(
+            "databricks_partitioning_preview_only",
+            "DatabricksAdapter.generate_tuning_clause builds PARTITIONED BY from tuned columns "
+            "(databricks/adapter.py:3005-3048) but has no production call site tree-wide, so no "
+            "PARTITIONED BY is rendered at preview or execution. Real execution builds Delta DDL in "
+            "_convert_to_delta_table (databricks/adapter.py:2672-2729), which never adds partitioning "
+            "columns, and apply_table_tunings only logs them via _log_partitioning_and_sorting.",
         ),
         _T.CLUSTERING: _post_load(
             "databricks_z_order_or_liquid",
@@ -307,7 +308,16 @@ PLATFORM_TUNING_CAPABILITIES: dict[str, dict[TuningType, TuningCapability]] = {
             "generate_tuning_clause returns '' and apply_table_tunings is a no-op. Tuned "
             "constraints flow through the shared mysql-wire tuning-aware DDL path, as on MySQL.",
         ),
-        **_constraint_entries(),
+        _T.PRIMARY_KEYS: _ddl(_INLINE_CONSTRAINT, _CONSTRAINT_NOTE),
+        _T.FOREIGN_KEYS: _none(
+            "singlestore_strips_foreign_keys",
+            "SingleStore strips FOREIGN KEY clauses from every CREATE TABLE at execution "
+            "(singlestore.py singlestore_strip_foreign_keys at 379-380, wired by the DDL_OPTIMIZE "
+            "strip_foreign_keys rule in sql_compat/rules/ddl_optimize/singlestore_ddl_rewrites.py:6-16). "
+            "Requested foreign keys never reach the engine (SingleStore error 2752).",
+        ),
+        _T.UNIQUE_CONSTRAINTS: _ddl(_INLINE_CONSTRAINT, _CONSTRAINT_NOTE),
+        _T.CHECK_CONSTRAINTS: _ddl(_INLINE_CONSTRAINT, _CONSTRAINT_NOTE),
     },
     "cedardb": {
         _T.PARTITIONING: _none(
