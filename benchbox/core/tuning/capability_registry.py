@@ -1009,7 +1009,7 @@ def interface_compatibility_map() -> dict[str, frozenset[TuningType]]:
 
 
 def resolve_platform_key(platform: str) -> str:
-    platform_key = platform.lower().replace("_", "-")
+    platform_key = platform.split(":", 1)[0].strip().lower().replace("_", "-")
     return PLATFORM_ALIASES.get(platform_key, platform_key)
 
 

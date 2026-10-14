@@ -69,11 +69,11 @@ def test_default_unified_config_disables_unique_and_check_constraints_on_duckdb(
     assert config.unique_constraints.enabled is False
 
 
-def test_default_unified_config_keeps_legacy_behavior_on_duckdb_memory_variant() -> None:
+def test_default_unified_config_shares_base_rules_on_duckdb_memory_variant() -> None:
     config = build_default_unified_config("duckdb:memory")
 
     assert config.check_constraints.enabled is False
-    assert config.unique_constraints.enabled is True
+    assert config.unique_constraints.enabled is False
 
 
 def test_default_unified_config_without_platform_keeps_all_constraints() -> None:
