@@ -60,7 +60,7 @@ def decide_parent(
         pooled = [sha for sha in bundled_shas if sha.strip()]
         if not pooled:
             return (dispatch_parent, "dispatch")
-        raise ParentResolutionError(f"no site-inputs bundle attested on parent {dispatch_parent}")
+        raise ParentResolutionError(f"no site-inputs bundle attested on parent {dispatch_parent} (missing)")
     for candidate in bundled_shas:
         if candidate and candidate != core_sha and is_ancestor_fn(candidate, core_sha):
             return (candidate, "bundle")
@@ -108,7 +108,12 @@ def recent_trunk_runs(repo: str, limit: int = 20) -> list[dict]:
     return [row for row in rows if isinstance(row, dict)]
 
 
-def recent_bundled_shas(repo: str, limit: int = 100) -> list[str]:
+def recent_bundled_shas(
+    repo: str,
+    limit: int = 100,
+    core_sha: str = "",
+    is_ancestor_fn: Callable[[str, str], bool] | None = None,
+) -> list[str]:
     raw = _gh(
         [
             "run",
@@ -144,40 +149,29 @@ def recent_bundled_shas(repo: str, limit: int = 100) -> list[str]:
             if name not in seen:
                 seen.add(name)
                 ordered.append(name)
+                if core_sha and name != core_sha and is_ancestor_fn is not None and is_ancestor_fn(name, core_sha):
+                    return ordered
     return ordered
 
 
 def parent_bundle_state(parent_sha: str, repo: str) -> str:
     expected = f"site-inputs-{parent_sha}"
-    runs_raw = _gh(
+    rows = _gh(
         [
             "api",
-            f"repos/{repo}/actions/workflows/site-inputs.yml/runs?branch=develop&status=success"
-            f"&per_page=100&head_sha={parent_sha}",
+            f"repos/{repo}/actions/artifacts?name={expected}&per_page=100",
             "-q",
-            ".workflow_runs[].id",
+            '.artifacts[] | "\\(.name) \\(.expired)"',
         ]
     )
-    run_ids = [line.strip() for line in runs_raw.split() if line.strip()]
-    if not run_ids:
-        return "missing"
     expired_seen = False
-    for run_id in run_ids:
-        rows = _gh(
-            [
-                "api",
-                f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100",
-                "-q",
-                f'.artifacts[] | select(.name == "{expected}") | "\\(.name) \\(.expired)"',
-            ]
-        )
-        for line in rows.splitlines():
-            parts = line.strip().split()
-            if len(parts) != 2 or parts[0] != expected:
-                continue
-            if parts[1] == "false":
-                return "bundle"
-            expired_seen = True
+    for line in rows.splitlines():
+        parts = line.strip().split()
+        if len(parts) != 2 or parts[0] != expected:
+            continue
+        if parts[1] == "false":
+            return "bundle"
+        expired_seen = True
     if expired_seen:
         return "expired"
     return "missing"
@@ -191,7 +185,7 @@ def resolve_and_decide(
     run_id: str,
 ) -> tuple[str, str, str]:
     dispatch_parent = resolve_commit(dispatch_parent_raw) if dispatch_parent_raw.strip() else None
-    bundled = recent_bundled_shas(repo, limit)
+    bundled = recent_bundled_shas(repo, limit, core_sha, is_ancestor)
     parent_sha, parent_source = decide_parent(
         core_sha, dispatch_parent, bundled, is_ancestor, lambda sha: parent_bundle_state(sha, repo)
     )

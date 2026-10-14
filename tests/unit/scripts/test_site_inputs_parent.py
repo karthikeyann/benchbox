@@ -135,3 +135,79 @@ def test_dispatch_build_records_newest_trunk_run_id() -> None:
 
 def test_automatic_build_keeps_triggering_run_id() -> None:
     assert parent_mod.decide_certified_by(CORE, "38344752905", []) == "38344752905"
+
+
+def test_automatic_lookup_with_empty_pool_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _gh_fixture(monkeypatch, {"run list": ""})
+    assert parent_mod.recent_bundled_shas("BenchBox-dev/benchbox") == []
+
+
+RUN_HEAD_SHA = "7ecc9b126876a0b64eff1707d8a3307df689c2ad"
+ARTIFACT_SHA = "d042e2624c6f7881d9213cd93c08eb038284d795"
+
+
+def _gh_fixture(monkeypatch: pytest.MonkeyPatch, routes: dict[str, str]) -> list[list[str]]:
+    import subprocess as subprocess_mod
+
+    real_run = subprocess_mod.run
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> object:
+        args = list(argv)
+        if args[0] == "gh":
+            calls.append(args)
+            command = " ".join(args[1:])
+            for prefix, body in routes.items():
+                if prefix in command:
+                    return subprocess_mod.CompletedProcess(args, 0, body, "")
+            raise AssertionError(f"unexpected gh call: {command}")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess_mod, "run", fake_run)
+    return calls
+
+
+def test_lookup_finds_bundle_whose_run_head_differs(monkeypatch: pytest.MonkeyPatch) -> None:
+    _gh_fixture(
+        monkeypatch,
+        {
+            "actions/workflows/site-inputs.yml/runs": "",
+            f"actions/artifacts?name=site-inputs-{ARTIFACT_SHA}": f"site-inputs-{ARTIFACT_SHA} false",
+        },
+    )
+    assert parent_mod.parent_bundle_state(ARTIFACT_SHA, "BenchBox-dev/benchbox") == "bundle"
+
+
+def test_lookup_reports_expired_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
+    _gh_fixture(
+        monkeypatch,
+        {
+            f"actions/artifacts?name=site-inputs-{ARTIFACT_SHA}": f"site-inputs-{ARTIFACT_SHA} true",
+        },
+    )
+    assert parent_mod.parent_bundle_state(ARTIFACT_SHA, "BenchBox-dev/benchbox") == "expired"
+
+
+def test_lookup_reports_missing_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
+    _gh_fixture(monkeypatch, {f"actions/artifacts?name=site-inputs-{ARTIFACT_SHA}": ""})
+    assert parent_mod.parent_bundle_state(ARTIFACT_SHA, "BenchBox-dev/benchbox") == "missing"
+
+
+def test_missing_refusal_names_sha_and_state() -> None:
+    with pytest.raises(RuntimeError, match=f"no site-inputs bundle attested on parent {PARENT}.*missing"):
+        parent_mod.decide_parent(CORE, PARENT, [OTHER], _ancestor_ok, lambda sha: "missing")
+
+
+def test_automatic_lookup_stops_at_first_bundled_ancestor(monkeypatch: pytest.MonkeyPatch) -> None:
+    first = "e" * 40
+    calls = _gh_fixture(
+        monkeypatch,
+        {
+            "run list": "111\n222\n333\n",
+            "actions/runs/111/artifacts": first,
+            "actions/runs/222/artifacts": PARENT,
+        },
+    )
+    ordered = parent_mod.recent_bundled_shas("BenchBox-dev/benchbox", 100, CORE, lambda parent, core: parent == PARENT)
+    assert ordered == [first, PARENT]
+    assert not [call for call in calls if "actions/runs/333/artifacts" in " ".join(call)]

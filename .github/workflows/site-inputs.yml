@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       parent_core_sha:
-        description: "Base SHA for the validator_parity attestation (default: the newest bundled ancestor on develop)"
+        description: "Base SHA for the validator_parity attestation (default: the newest bundled ancestor on develop; bundle artifacts expire after 90 days, so recovery to an older parent needs a fresh dispatch chain)"
         required: false
         default: ""
 
