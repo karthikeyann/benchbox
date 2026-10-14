@@ -77,7 +77,12 @@ def decide_certified_by(
     for run in trunk_runs:
         if not isinstance(run, dict):
             continue
-        if str(run.get("event")) == "push" and run.get("headSha") == core_sha:
+        if (
+            str(run.get("event")) == "push"
+            and run.get("headSha") == core_sha
+            and str(run.get("headBranch")) == "develop"
+            and str(run.get("conclusion")) == "success"
+        ):
             return str(run.get("databaseId"))
     raise ParentResolutionError(f"no successful trunk.yml push run on {core_sha}")
 
@@ -94,7 +99,7 @@ def recent_trunk_runs(repo: str, limit: int = 20) -> list[dict]:
             "--status",
             "success",
             "--json",
-            "databaseId,headSha,event",
+            "databaseId,headSha,headBranch,event,conclusion",
             "--limit",
             str(limit),
         ]

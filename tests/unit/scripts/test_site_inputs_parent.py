@@ -104,7 +104,13 @@ def test_resolve_commit_rejects_unknown_ref() -> None:
         parent_mod.resolve_commit("no-such-ref-for-site-inputs-parent")
 
 
-TRUNK_RUN = {"databaseId": 38216829987, "headSha": CORE, "event": "push"}
+TRUNK_RUN = {
+    "databaseId": 38216829987,
+    "headSha": CORE,
+    "headBranch": "develop",
+    "event": "push",
+    "conclusion": "success",
+}
 
 
 def test_dispatch_build_records_numeric_trunk_run_id() -> None:
@@ -135,6 +141,18 @@ def test_dispatch_build_records_newest_trunk_run_id() -> None:
 
 def test_automatic_build_keeps_triggering_run_id() -> None:
     assert parent_mod.decide_certified_by(CORE, "38344752905", []) == "38344752905"
+
+
+def test_dispatch_build_refuses_non_develop_trunk_run() -> None:
+    foreign = dict(TRUNK_RUN, headBranch="feature")
+    with pytest.raises(RuntimeError, match="no successful trunk.yml push run"):
+        parent_mod.decide_certified_by(CORE, "", [foreign])
+
+
+def test_dispatch_build_refuses_unsuccessful_trunk_run() -> None:
+    failed = dict(TRUNK_RUN, conclusion="failure")
+    with pytest.raises(RuntimeError, match="no successful trunk.yml push run"):
+        parent_mod.decide_certified_by(CORE, "", [failed])
 
 
 def test_automatic_lookup_with_empty_pool_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
