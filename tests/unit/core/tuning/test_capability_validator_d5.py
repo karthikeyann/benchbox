@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -111,6 +112,88 @@ class TestRequestedButNotRenderedIsAnError:
             errors, _warnings = config.validate_for_platform_detailed(platform)
             assert any("requested unique_constraints is not applied at execution" in e for e in errors), platform
 
+    def test_vacuous_unique_check_types_error(self) -> None:
+        for platform in (
+            "duckdb",
+            "databricks",
+            "snowflake",
+            "sqlite",
+            "postgresql",
+            "mysql",
+            "singlestore",
+            "cedardb",
+            "citus",
+            "paradedb",
+            "fabric-warehouse",
+            "athena",
+            "azure-synapse",
+            "timescaledb",
+            "redshift",
+            "firebolt",
+            "questdb",
+            "pg-duckdb",
+            "pg-mooncake",
+            "trino",
+            "presto",
+        ):
+            for tuning_attr in ("unique_constraints", "check_constraints"):
+                config = UnifiedTuningConfiguration()
+                config.disable_all_constraints()
+                getattr(config, tuning_attr).enabled = True
+                errors, _warnings = config.validate_for_platform_detailed(platform)
+                assert any(f"requested {tuning_attr} is not applied at execution" in e for e in errors), (
+                    platform,
+                    tuning_attr,
+                )
+
+    def test_bigquery_unique_and_clickhouse_fk_check_error(self) -> None:
+        for platform, tuning_attr in (
+            ("bigquery", "unique_constraints"),
+            ("clickhouse", "foreign_keys"),
+            ("clickhouse", "check_constraints"),
+        ):
+            config = UnifiedTuningConfiguration()
+            config.disable_all_constraints()
+            getattr(config, tuning_attr).enabled = True
+            errors, _warnings = config.validate_for_platform_detailed(platform)
+            assert any(f"requested {tuning_attr} is not applied at execution" in e for e in errors), (
+                platform,
+                tuning_attr,
+            )
+
+    def test_dropped_pk_fk_types_error(self) -> None:
+        for platform, tuning_attr in (
+            ("firebolt", "primary_keys"),
+            ("firebolt", "foreign_keys"),
+            ("questdb", "primary_keys"),
+            ("questdb", "foreign_keys"),
+            ("trino", "primary_keys"),
+            ("presto", "primary_keys"),
+        ):
+            config = UnifiedTuningConfiguration()
+            config.disable_all_constraints()
+            getattr(config, tuning_attr).enabled = True
+            errors, _warnings = config.validate_for_platform_detailed(platform)
+            assert any(f"requested {tuning_attr} is not applied at execution" in e for e in errors), (
+                platform,
+                tuning_attr,
+            )
+
+    def test_rendered_pk_fk_types_do_not_error(self) -> None:
+        for platform, tuning_attr in (
+            ("pg-duckdb", "primary_keys"),
+            ("pg-duckdb", "foreign_keys"),
+            ("pg-mooncake", "primary_keys"),
+            ("pg-mooncake", "foreign_keys"),
+            ("trino", "foreign_keys"),
+            ("presto", "foreign_keys"),
+        ):
+            config = UnifiedTuningConfiguration()
+            config.disable_all_constraints()
+            getattr(config, tuning_attr).enabled = True
+            errors, _warnings = config.validate_for_platform_detailed(platform)
+            assert errors == [], (platform, tuning_attr, errors)
+
 
 _LIFECYCLE_ROOTS = frozenset(
     {
@@ -127,6 +210,10 @@ _LIFECYCLE_ROOTS = frozenset(
 _EXECUTE_ATTRS = frozenset({"execute", "executescript", "exec"})
 
 _QUERY_ATTRS = frozenset({"sql", "query"})
+
+_STATEMENT_EXEC_RECEIVERS = frozenset({"connection", "conn", "client", "cursor", "engine", "db"})
+
+_STATEMENT_EXEC_ARG_MARKERS = frozenset({"ddl", "create", "table", "schema", "statement"})
 
 _STATEMENT_EXEC_METHODS = frozenset(
     {
@@ -568,6 +655,30 @@ def _sub_replacement_reemits_match(replacement: ast.AST | None) -> bool:
     return True
 
 
+def _execution_receiver(value: ast.AST) -> bool:
+    root = _receiver_root(value)
+    if root in _STATEMENT_EXEC_RECEIVERS:
+        return True
+    if root not in ("self", "adapter", "cls"):
+        return False
+    try:
+        dotted = ast.unparse(value).lower()
+    except (ValueError, SyntaxError):
+        return False
+    return dotted.split(".")[-1].strip("_") in _STATEMENT_EXEC_RECEIVERS
+
+
+def _statement_argument(call: ast.Call) -> bool:
+    try:
+        haystack = " ".join(
+            [ast.unparse(argument) for argument in call.args]
+            + [ast.unparse(keyword.value) for keyword in call.keywords]
+        ).lower()
+    except (ValueError, SyntaxError):
+        return False
+    return any(marker in haystack for marker in _STATEMENT_EXEC_ARG_MARKERS)
+
+
 def _scan_call(
     child: ast.Call,
     parents: dict[int, ast.AST],
@@ -580,11 +691,15 @@ def _scan_call(
         if not isinstance(parents.get(id(child)), ast.Return):
             acc["sql_exec"] = True
     if isinstance(func, ast.Attribute) and func.attr in _QUERY_ATTRS:
-        if enclosing in _STATEMENT_EXEC_METHODS and not isinstance(parents.get(id(child)), ast.Return):
+        if (
+            enclosing in _STATEMENT_EXEC_METHODS
+            and not isinstance(parents.get(id(child)), ast.Return)
+            and _execution_receiver(func.value)
+            and _statement_argument(child)
+        ):
             acc["sql_exec"] = True
     if isinstance(func, ast.Name) and func.id in _STRIP_CALLS:
         if not _strip_conditional(child, parents, body):
-            acc["strips"] = True
             if func.id == "strip_primary_keys":
                 acc["strip_pk"] = True
             else:
@@ -599,7 +714,6 @@ def _scan_call(
         if "foreign" in lowered and "key" in lowered:
             kinds.add("fk")
         if kinds and not _sub_replacement_reemits_match(replacement) and not _strip_conditional(child, parents, body):
-            acc["strips"] = True
             if "pk" in kinds:
                 acc["strip_pk"] = True
             if "fk" in kinds:
@@ -615,11 +729,10 @@ def _scan_call(
 
 def _signals(
     bodies: list[ast.FunctionDef],
-) -> tuple[bool, bool, bool, bool, bool, bool, list[str]]:
+) -> tuple[bool, bool, bool, bool, bool, list[str]]:
     acc = {
         "tuning_read": False,
         "sql_exec": False,
-        "strips": False,
         "ddl_handoff": False,
         "strip_pk": False,
         "strip_fk": False,
@@ -641,7 +754,6 @@ def _signals(
     return (
         acc["tuning_read"],
         acc["sql_exec"],
-        acc["strips"],
         acc["ddl_handoff"],
         acc["strip_pk"],
         acc["strip_fk"],
@@ -649,19 +761,37 @@ def _signals(
     )
 
 
+_TYPE_EVIDENCE_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    tuning_value: tuple(re.compile(r"\b" + re.escape(token) + r"\b") for token in tokens)
+    for tuning_value, tokens in _TYPE_EVIDENCE_TOKENS.items()
+}
+
+
+def _rendered_gate_passes(tuning_read: bool, sql_exec: bool, evidenced: bool, override: bool) -> bool:
+    return override or ((tuning_read and sql_exec) and evidenced)
+
+
+def _noop_gate_excused(
+    tuning_value: str, strip_pk: bool, strip_fk: bool, reg_pk: bool, reg_fk: bool, justified: bool
+) -> bool:
+    if tuning_value == "primary_keys" and (strip_pk or reg_pk):
+        return True
+    if tuning_value == "foreign_keys" and (strip_fk or reg_fk):
+        return True
+    return justified
+
+
 def _type_evidenced(
     tuning_type_value: str, texts: list[str], ddl_handoff: bool, strip_pk: bool, strip_fk: bool
 ) -> bool:
-    tokens = _TYPE_EVIDENCE_TOKENS.get(tuning_type_value, ())
-    if any(token in text for text in texts for token in tokens):
+    patterns = _TYPE_EVIDENCE_PATTERNS.get(tuning_type_value, ())
+    if any(pattern.search(text) for text in texts for pattern in patterns):
         return True
     if tuning_type_value in ("primary_keys", "foreign_keys") and ddl_handoff:
         if tuning_type_value == "primary_keys" and not strip_pk:
             return True
         if tuning_type_value == "foreign_keys" and not strip_fk:
             return True
-    if tuning_type_value in ("unique_constraints", "check_constraints") and ddl_handoff:
-        return not strip_pk and not strip_fk
     return False
 
 
@@ -828,6 +958,7 @@ _MATERIALIZED_VIEW_CREATION_PHRASES = (
 )
 
 _ABSENCE_CLAIMS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
+    ("databend", "materialized_views"): ("databend", _MATERIALIZED_VIEW_CREATION_PHRASES),
     ("databricks", "bloom_filters"): ("databricks", _BLOOM_ABSENCE_PHRASES),
     ("databricks", "materialized_views"): ("databricks", _MATERIALIZED_VIEW_CREATION_PHRASES),
     ("snowflake", "materialized_views"): ("snowflake", _MATERIALIZED_VIEW_CREATION_PHRASES),
@@ -1019,7 +1150,8 @@ _NONE_JUSTIFICATION_OVERRIDES: dict[tuple[str, str], str] = {
     "executes statements only (clickhouse_server.py); no materialized-view creation exists in its "
     "lifecycle.",
     ("clickhouse", "unique_constraints"): "ClickHouse has no UNIQUE constraint syntax; the workload "
-    "selects DUPLICATE versus PRIMARY KEY models instead (clickhouse/workload.py).",
+    "selects DUPLICATE versus PRIMARY KEY models instead (clickhouse/workload.py). Vacuity pinned "
+    "tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
     ("motherduck", "partitioning"): "tuning_config dropped at create_schema (motherduck.py:307-318).",
     ("motherduck", "clustering"): "No post-create CLUSTER step consumes tuning (motherduck.py).",
     ("motherduck", "distribution"): "Single-writer cloud DuckDB; nothing renders distribution columns (motherduck.py).",
@@ -1027,30 +1159,40 @@ _NONE_JUSTIFICATION_OVERRIDES: dict[tuple[str, str], str] = {
     "only (motherduck.py); no materialized-view creation exists in its lifecycle.",
     ("motherduck", "primary_keys"): "tuning_config dropped; applier pass-through no-op (motherduck.py:354-355).",
     ("motherduck", "foreign_keys"): "tuning_config dropped; applier pass-through no-op (motherduck.py:354-355).",
-    ("motherduck", "unique_constraints"): "tuning_config dropped; applier pass-through no-op (motherduck.py:354-355).",
-    ("motherduck", "check_constraints"): "tuning_config dropped; applier pass-through no-op (motherduck.py:354-355).",
+    ("motherduck", "unique_constraints"): "tuning_config dropped; applier pass-through no-op (motherduck.py:354-355). "
+    "Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("motherduck", "check_constraints"): "tuning_config dropped; applier pass-through no-op (motherduck.py:354-355). "
+    "Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
     ("datafusion", "primary_keys"): "Schema built explicitly without constraints (datafusion.py:558-564).",
     ("datafusion", "foreign_keys"): "Schema built explicitly without constraints (datafusion.py:558-564).",
-    ("datafusion", "unique_constraints"): "Schema built explicitly without constraints (datafusion.py:558-564).",
-    ("datafusion", "check_constraints"): "Schema built explicitly without constraints (datafusion.py:558-564).",
+    ("datafusion", "unique_constraints"): "Schema built explicitly without constraints (datafusion.py:558-564). "
+    "Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("datafusion", "check_constraints"): "Schema built explicitly without constraints (datafusion.py:558-564). "
+    "Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
     ("doris", "primary_keys"): "Adapter strips PRIMARY KEY clauses from every CREATE TABLE (doris.py:803-805).",
     ("doris", "foreign_keys"): "Adapter strips foreign keys from every CREATE TABLE (doris.py:802).",
     ("databend", "foreign_keys"): "Adapter strips foreign keys from every CREATE TABLE (databend/adapter.py:680).",
     ("databend", "primary_keys"): "Adapter strips PRIMARY KEY clauses via inline regex (databend/adapter.py:678).",
-    ("doris", "unique_constraints"): "NoOp adapter; UNIQUE never produced or consumed from tuning (doris.py).",
-    ("doris", "check_constraints"): "NoOp adapter; CHECK never produced or consumed from tuning (doris.py).",
+    ("doris", "unique_constraints"): "NoOp adapter; UNIQUE never produced or consumed from tuning (doris.py). "
+    "Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("doris", "check_constraints"): "NoOp adapter; CHECK never produced or consumed from tuning (doris.py). "
+    "Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
     ("databend", "unique_constraints"): "Only CLUSTERING renders; UNIQUE never produced or consumed from tuning "
-    "(databend/adapter.py).",
+    "(databend/adapter.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
     ("databend", "check_constraints"): "Only CLUSTERING renders; CHECK never produced or consumed from tuning "
-    "(databend/adapter.py).",
+    "(databend/adapter.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
     (
         "starrocks",
         "unique_constraints",
-    ): "Workload rewrite handles PARTITION/DISTRIBUTION/ORDER BY plus PK-model only (starrocks/workload.py:109-198).",
+    ): "Workload rewrite handles PARTITION/DISTRIBUTION/ORDER BY plus PK-model only "
+    "(starrocks/workload.py:109-198). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
     (
         "starrocks",
         "check_constraints",
-    ): "Workload rewrite handles PARTITION/DISTRIBUTION/ORDER BY plus PK-model only (starrocks/workload.py:109-198).",
+    ): "Workload rewrite handles PARTITION/DISTRIBUTION/ORDER BY plus PK-model only "
+    "(starrocks/workload.py:109-198). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
     (
         "mysql",
         "partitioning",
@@ -1062,7 +1204,199 @@ _NONE_JUSTIFICATION_OVERRIDES: dict[tuple[str, str], str] = {
         "fabric-warehouse",
         "partitioning",
     ): "T-SQL execution ignores tuned partition columns (fabric_warehouse.py:857-883).",
+    ("duckdb", "unique_constraints"): "DuckDBAdapter.apply_constraint_configuration only logs UNIQUE flag "
+    "state (duckdb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("duckdb", "check_constraints"): "DuckDBAdapter.apply_constraint_configuration only logs CHECK flag "
+    "state (duckdb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("databricks", "unique_constraints"): "DatabricksAdapter executes tuning only through ZORDER, OPTIMIZE, "
+    "Liquid and CLUSTER statements (databricks/adapter.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("databricks", "check_constraints"): "DatabricksAdapter executes tuning only through ZORDER, OPTIMIZE, "
+    "Liquid and CLUSTER statements (databricks/adapter.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("snowflake", "unique_constraints"): "SnowflakeAdapter tuning executes ALTER TABLE ... CLUSTER BY and "
+    "constraint-bearing CREATE TABLE carrying PK/FK only (snowflake.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("snowflake", "check_constraints"): "SnowflakeAdapter tuning executes ALTER TABLE ... CLUSTER BY and "
+    "constraint-bearing CREATE TABLE carrying PK/FK only (snowflake.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("bigquery", "unique_constraints"): "BigQuery DDL emits PRIMARY KEY (...) NOT ENFORCED plus FOREIGN KEY "
+    "clauses only (bigquery.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("bigquery", "check_constraints"): "BigQuery DDL emits PRIMARY KEY (...) NOT ENFORCED plus FOREIGN KEY "
+    "clauses only (bigquery.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("sqlite", "unique_constraints"): "The shared tuning-aware DDL path forwards tuning_config; SQLite "
+    "execution builds no UNIQUE clause from the flags (base/data_loading.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("sqlite", "check_constraints"): "The shared tuning-aware DDL path forwards tuning_config; SQLite "
+    "execution builds no CHECK clause from the flags (base/data_loading.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("postgresql", "unique_constraints"): "PostgreSQLAdapter renders constraint-bearing CREATE TABLE from "
+    "PK/FK flags only (postgresql.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("postgresql", "check_constraints"): "PostgreSQLAdapter renders constraint-bearing CREATE TABLE from "
+    "PK/FK flags only (postgresql.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("mysql", "unique_constraints"): "The mysql-wire tuning-aware DDL path renders PK/FK from flags only "
+    "(base/mysql_wire.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("mysql", "check_constraints"): "The mysql-wire tuning-aware DDL path renders PK/FK from flags only "
+    "(base/mysql_wire.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("singlestore", "unique_constraints"): "SingleStoreAdapter inherits the mysql-wire tuning-aware DDL path "
+    "rendering PK from flags only (singlestore.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("singlestore", "check_constraints"): "SingleStoreAdapter inherits the mysql-wire tuning-aware DDL path "
+    "rendering PK from flags only (singlestore.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("cedardb", "unique_constraints"): "CedarDBAdapter inherits PostgreSQLAdapter execution rendering PK/FK "
+    "from flags only (cedardb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("cedardb", "check_constraints"): "CedarDBAdapter inherits PostgreSQLAdapter execution rendering PK/FK "
+    "from flags only (cedardb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("citus", "unique_constraints"): "CitusAdapter inherits PostgreSQLAdapter execution rendering PK/FK from "
+    "flags only (citus.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("citus", "check_constraints"): "CitusAdapter inherits PostgreSQLAdapter execution rendering PK/FK from "
+    "flags only (citus.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("paradedb", "unique_constraints"): "ParadeDBAdapter inherits PostgreSQLAdapter execution rendering PK/FK "
+    "from flags only (paradedb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("paradedb", "check_constraints"): "ParadeDBAdapter inherits PostgreSQLAdapter execution rendering PK/FK "
+    "from flags only (paradedb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("fabric-warehouse", "unique_constraints"): "FabricWarehouseAdapter executes T-SQL carrying PK/FK only "
+    "(fabric_warehouse.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("fabric-warehouse", "check_constraints"): "FabricWarehouseAdapter executes T-SQL carrying PK/FK only "
+    "(fabric_warehouse.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("athena", "unique_constraints"): "AthenaAdapter._convert_to_external_table builds CREATE EXTERNAL TABLE "
+    "without UNIQUE clauses (athena.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("athena", "check_constraints"): "AthenaAdapter._convert_to_external_table builds CREATE EXTERNAL TABLE "
+    "without CHECK clauses (athena.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("azure-synapse", "unique_constraints"): "AzureSynapseAdapter real DDL carries PK/FK with the engine-default "
+    "DISTRIBUTION only (azure_synapse.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("azure-synapse", "check_constraints"): "AzureSynapseAdapter real DDL carries PK/FK with the engine-default "
+    "DISTRIBUTION only (azure_synapse.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("timescaledb", "unique_constraints"): "TimescaleDBAdapter hypertable and compression paths consume no "
+    "UNIQUE tuning (timescaledb.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
+    ("timescaledb", "check_constraints"): "TimescaleDBAdapter hypertable and compression paths consume no CHECK "
+    "tuning (timescaledb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("redshift", "unique_constraints"): "RedshiftAdapter tuning executes CTAS-sort, VACUUM and maintenance "
+    "statements only (redshift.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("redshift", "check_constraints"): "RedshiftAdapter tuning executes CTAS-sort, VACUUM and maintenance "
+    "statements only (redshift.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("questdb", "unique_constraints"): "QuestDB schema enhancement maps hardcoded timestamp/partition columns "
+    "only (questdb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("questdb", "check_constraints"): "QuestDB schema enhancement maps hardcoded timestamp/partition columns "
+    "only (questdb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("questdb", "primary_keys"): "QuestDBAdapter.create_schema strips PRIMARY KEY clauses via "
+    "_strip_pk_constraints (questdb.py); pinned by test_questdb_create_schema_strips_constraints.",
+    ("questdb", "foreign_keys"): "QuestDBAdapter.create_schema strips FOREIGN KEY clauses via ddl_helpers "
+    "strip_foreign_keys (questdb.py); pinned by test_questdb_create_schema_strips_constraints.",
+    ("pg-duckdb", "unique_constraints"): "PgDuckDBAdapter inherits PostgreSQLAdapter execution carrying PK/FK "
+    "only (pg_duckdb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("pg-duckdb", "check_constraints"): "PgDuckDBAdapter inherits PostgreSQLAdapter execution carrying PK/FK "
+    "only (pg_duckdb.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("pg-mooncake", "unique_constraints"): "PgMooncakeAdapter inherits PostgreSQLAdapter execution carrying "
+    "PK/FK only (pg_mooncake.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("pg-mooncake", "check_constraints"): "PgMooncakeAdapter inherits PostgreSQLAdapter execution carrying "
+    "PK/FK only (pg_mooncake.py). Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("trino", "unique_constraints"): "TrinoAdapter renders no UNIQUE clause at execution (trino.py). Vacuity "
+    "pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("trino", "check_constraints"): "TrinoAdapter renders no CHECK clause at execution (trino.py). Vacuity "
+    "pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("trino", "primary_keys"): "PrestoTrinoAdapterBase._optimize_table_definition strips PRIMARY KEY clauses "
+    "from every CREATE TABLE (presto_trino_adapter_base.py); pinned by "
+    "test_trino_base_optimize_strips_primary_keys.",
+    ("presto", "unique_constraints"): "PrestoAdapter renders no UNIQUE clause at execution (presto.py). Vacuity "
+    "pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("presto", "check_constraints"): "PrestoAdapter renders no CHECK clause at execution (presto.py). Vacuity "
+    "pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("presto", "primary_keys"): "PrestoTrinoAdapterBase._optimize_table_definition strips PRIMARY KEY clauses "
+    "from every CREATE TABLE (presto_trino_adapter_base.py); pinned by "
+    "test_trino_base_optimize_strips_primary_keys.",
+    ("firebolt", "primary_keys"): "FireboltAdapter._optimize_table_definition strips PRIMARY KEY clauses from "
+    "every CREATE TABLE (firebolt.py).",
+    ("firebolt", "foreign_keys"): "FireboltAdapter._optimize_table_definition strips FOREIGN KEY clauses from "
+    "every CREATE TABLE (firebolt.py).",
+    ("firebolt", "unique_constraints"): "FireboltAdapter renders no UNIQUE clause at execution (firebolt.py). "
+    "Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("firebolt", "check_constraints"): "FireboltAdapter renders no CHECK clause at execution (firebolt.py). "
+    "Vacuity pinned tree-wide by test_unique_check_rendering_is_vacuous_in_tree.",
+    ("clickhouse", "foreign_keys"): "ClickHouseWorkloadMixin._optimize_table_definition preserves FOREIGN KEY "
+    "clauses the engine rejects (clickhouse/workload.py); pinned by "
+    "test_clickhouse_optimize_preserves_foreign_keys.",
+    ("clickhouse", "check_constraints"): "The ClickHouse workload column parser terminates column types at "
+    "CHECK keywords without rendering them (clickhouse/workload.py). Vacuity pinned tree-wide by "
+    "test_unique_check_rendering_is_vacuous_in_tree.",
 }
+
+
+_BEHAVIORAL_STRIP_TESTS: dict[tuple[str, str], str] = {
+    ("questdb", "primary_keys"): "test_questdb_create_schema_strips_constraints",
+    ("questdb", "foreign_keys"): "test_questdb_create_schema_strips_constraints",
+    ("trino", "primary_keys"): "test_trino_base_optimize_strips_primary_keys",
+    ("presto", "primary_keys"): "test_trino_base_optimize_strips_primary_keys",
+    ("clickhouse", "foreign_keys"): "test_clickhouse_optimize_preserves_foreign_keys",
+    ("azure-synapse", "distribution"): "test_azure_synapse_optimize_uses_engine_default",
+}
+
+
+_NO_TUNING_INPUT_TESTS: dict[tuple[str, str], str] = {
+    ("athena", "partitioning"): "test_athena_rewrite_takes_no_tuning",
+    ("athena", "sorting"): "test_athena_rewrite_takes_no_tuning",
+    ("athena", "clustering"): "test_athena_rewrite_takes_no_tuning",
+    ("questdb", "partitioning"): "test_questdb_enhancement_takes_no_tuning",
+}
+
+
+_SCHEMA_IGNORES_CONSTRAINTS_TESTS: dict[tuple[str, str], str] = {
+    ("datafusion", "primary_keys"): "test_datafusion_schema_ignores_constraints",
+    ("datafusion", "foreign_keys"): "test_datafusion_schema_ignores_constraints",
+}
+
+
+_DROPS_TUNING_TESTS: dict[tuple[str, str], str] = {
+    ("motherduck", "primary_keys"): "test_motherduck_create_schema_drops_tuning",
+    ("motherduck", "foreign_keys"): "test_motherduck_create_schema_drops_tuning",
+    ("motherduck", "clustering"): "test_motherduck_create_schema_drops_tuning",
+}
+
+
+_IGNORES_TUNING_METHODS: dict[tuple[str, str], str] = {
+    ("timescaledb", "sorting"): "test_timescaledb_compression_ignores_tuning",
+    ("timescaledb", "clustering"): "test_timescaledb_compression_ignores_tuning",
+}
+
+
+_GENERATOR_QUIET_FIELDS: dict[tuple[str, str], str] = {
+    ("databricks", "distribution"): "distribute_by",
+    ("firebolt", "sorting"): "sort_by",
+    ("firebolt", "clustering"): "cluster_by",
+    ("questdb", "sorting"): "sort_by",
+    ("questdb", "distribution"): "distribute_by",
+    ("azure-synapse", "sorting"): "sort_by",
+    ("azure-synapse", "clustering"): "cluster_by",
+}
+
+
+_DATABEND_QUIET_KINDS: frozenset[str] = frozenset({"partitioning", "sorting", "distribution"})
+
+
+_LAYOUT_QUIET: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("athena", "distribution"),
+        ("duckdb", "partitioning"),
+        ("fabric-warehouse", "partitioning"),
+        ("motherduck", "partitioning"),
+        ("motherduck", "distribution"),
+        ("azure-synapse", "partitioning"),
+        ("redshift", "partitioning"),
+        ("timescaledb", "partitioning"),
+        ("timescaledb", "distribution"),
+    }
+)
+
+
+_VACUITY_TEST_NAME = "test_unique_check_rendering_is_vacuous_in_tree"
 
 
 _UNCALLED_GENERATOR_KEYS = frozenset(
@@ -1085,6 +1419,8 @@ _UNCALLED_GENERATOR_KEYS = frozenset(
         ("redshift", "partitioning"),
         ("redshift", "distribution"),
         ("databricks", "partitioning"),
+        ("azure-synapse", "partitioning"),
+        ("azure-synapse", "distribution"),
     }
 )
 
@@ -1104,6 +1440,8 @@ _RETURNS_EMPTY_GENERATOR_KEYS = frozenset(
         ("pg-mooncake", "partitioning"),
         ("pg-mooncake", "clustering"),
         ("pg-mooncake", "sorting"),
+        ("singlestore", "partitioning"),
+        ("mysql", "partitioning"),
     }
 )
 
@@ -1134,70 +1472,143 @@ def _lifecycle_generator_calls(adapter_cls: type) -> dict[str, list[str]]:
     return found
 
 
+_VACUITY_SIGNATURE_ONLY: dict[tuple[str, str], str] = {
+    ("tpcds_obt", "TPCDSOBT"): "get_create_tables_sql accepts no tuning_config",
+}
+
+
+def _discovered_benchmarks() -> list[tuple[str, str, type]]:
+    import importlib
+    import pkgutil
+
+    import benchbox
+
+    found: list[tuple[str, str, type]] = []
+    seen: set[int] = set()
+    entries = sorted(pkgutil.iter_modules(benchbox.__path__), key=lambda entry: entry.name)
+    for module in entries:
+        imported = importlib.import_module(f"benchbox.{module.name}")
+        for attribute in sorted(vars(imported)):
+            value = vars(imported)[attribute]
+            if (
+                inspect.isclass(value)
+                and hasattr(value, "get_create_tables_sql")
+                and value.__module__.split(".")[0] == "benchbox"
+                and id(value) not in seen
+            ):
+                seen.add(id(value))
+                found.append((module.name, attribute, value))
+    return found
+
+
+def _vacuous_capable_benchmarks() -> list[tuple[str, str, object]]:
+    capable: list[tuple[str, str, object]] = []
+    for module_name, class_name, benchmark_cls in _discovered_benchmarks():
+        if (module_name, class_name) in _VACUITY_SIGNATURE_ONLY:
+            parameters = inspect.signature(benchmark_cls.get_create_tables_sql).parameters
+            assert "tuning_config" not in parameters, (
+                f"{module_name}.{class_name} now accepts tuning_config; cover it behaviorally"
+            )
+            continue
+        try:
+            benchmark = benchmark_cls()
+        except Exception as exc:
+            pytest.fail(
+                f"{module_name}.{class_name} needs explicit construction ({exc}); construct it in "
+                "_vacuous_capable_benchmarks or classify it in _VACUITY_SIGNATURE_ONLY"
+            )
+        parameters = inspect.signature(benchmark.get_create_tables_sql).parameters
+        assert "tuning_config" in parameters, (
+            f"{module_name}.{class_name} accepts no tuning_config; classify it in _VACUITY_SIGNATURE_ONLY"
+        )
+        capable.append((module_name, class_name, benchmark))
+    assert capable, "no behaviorally covered benchmarks; the vacuity proof is empty"
+    return capable
+
+
+_PARITY_ALIAS_TARGETS: dict[str, str] = {"starburst": "trino"}
+
+
+def _parity_targets() -> list[tuple[str, str]]:
+    targets = [
+        (platform_key, platform_key) for platform_key in sorted(known_registry_platforms() - _SKIP_NO_ADAPTER_CLASS)
+    ]
+    targets.extend(sorted(_PARITY_ALIAS_TARGETS.items()))
+    return targets
+
+
 class TestRegistryExecutionParity:
-    @pytest.mark.parametrize(
-        "platform_key",
-        sorted(known_registry_platforms() - _SKIP_NO_ADAPTER_CLASS),
-    )
-    def test_rendered_entries_have_executing_implementation(self, platform_key: str) -> None:
-        adapter_cls = _adapter_class(resolve_platform_key(platform_key))
-        assert adapter_cls is not None, f"no adapter class mapped for registry platform '{platform_key}'"
-        bodies = _reachable_bodies(adapter_cls, _PLATFORM_SKIP_MODULES.get(platform_key, frozenset()))
+    @pytest.mark.parametrize("adapter_key,registry_key", _parity_targets())
+    def test_rendered_entries_have_executing_implementation(self, adapter_key: str, registry_key: str) -> None:
+        adapter_cls = _adapter_class(resolve_platform_key(adapter_key))
+        assert adapter_cls is not None, f"no adapter class mapped for registry platform '{adapter_key}'"
+        bodies = _reachable_bodies(adapter_cls, _PLATFORM_SKIP_MODULES.get(adapter_key, frozenset()))
         assert bodies, f"no lifecycle roots reachable on {adapter_cls.__name__}"
-        tuning_read, sql_exec, _strips, ddl_handoff, strip_pk, strip_fk, texts = _signals(bodies)
-        for tuning_type, capability in PLATFORM_TUNING_CAPABILITIES[platform_key].items():
+        tuning_read, sql_exec, ddl_handoff, strip_pk, strip_fk, texts = _signals(bodies)
+        for tuning_type, capability in PLATFORM_TUNING_CAPABILITIES[registry_key].items():
             if is_not_rendered_at_execution(capability):
                 continue
-            key = (platform_key, tuning_type.value)
+            key = (registry_key, tuning_type.value)
             evidenced = _type_evidenced(tuning_type.value, texts, ddl_handoff, strip_pk, strip_fk)
-            assert key in _RENDERED_OVERRIDE_JUSTIFICATIONS or ((tuning_read and sql_exec) and evidenced), (
-                f"{platform_key}/{tuning_type.value} is registered '{capability.rendered_via}' "
+            assert _rendered_gate_passes(tuning_read, sql_exec, evidenced, key in _RENDERED_OVERRIDE_JUSTIFICATIONS), (
+                f"{adapter_key}/{tuning_type.value} is registered '{capability.rendered_via}' "
                 f"({capability.mechanism_id}) but the {adapter_cls.__name__} lifecycle shows "
                 f"tuning_read={tuning_read} sql_exec={sql_exec} type_evidenced={evidenced}; "
                 f"add execution or correct the registry"
             )
 
-    @pytest.mark.parametrize(
-        "platform_key",
-        sorted(known_registry_platforms() - _SKIP_NO_ADAPTER_CLASS),
-    )
-    def test_noop_entries_are_justified(self, platform_key: str) -> None:
-        adapter_cls = _adapter_class(resolve_platform_key(platform_key))
-        assert adapter_cls is not None, f"no adapter class mapped for registry platform '{platform_key}'"
-        bodies = _reachable_bodies(adapter_cls, _PLATFORM_SKIP_MODULES.get(platform_key, frozenset()))
-        _tuning_read, _sql_exec, _strips, _ddl_handoff, strip_pk, strip_fk, _texts = _signals(bodies)
-        reg_pk, reg_fk = _registered_kind_strips(platform_key)
-        for tuning_type, capability in PLATFORM_TUNING_CAPABILITIES[platform_key].items():
+    @pytest.mark.parametrize("adapter_key,registry_key", _parity_targets())
+    def test_noop_entries_are_justified(self, adapter_key: str, registry_key: str) -> None:
+        adapter_cls = _adapter_class(resolve_platform_key(adapter_key))
+        assert adapter_cls is not None, f"no adapter class mapped for registry platform '{adapter_key}'"
+        bodies = _reachable_bodies(adapter_cls, _PLATFORM_SKIP_MODULES.get(adapter_key, frozenset()))
+        _tuning_read, _sql_exec, _ddl_handoff, strip_pk, strip_fk, _texts = _signals(bodies)
+        reg_pk, reg_fk = _registered_kind_strips(registry_key)
+        for tuning_type, capability in PLATFORM_TUNING_CAPABILITIES[registry_key].items():
             if not is_not_rendered_at_execution(capability):
                 continue
-            key = (platform_key, tuning_type.value)
-            kind_stripped = (tuning_type.value == "primary_keys" and (strip_pk or reg_pk)) or (
-                tuning_type.value == "foreign_keys" and (strip_fk or reg_fk)
-            )
-            assert kind_stripped or key in _NONE_JUSTIFICATION_OVERRIDES, (
-                f"{platform_key}/{tuning_type.value} is registered not-rendered but the "
+            key = (registry_key, tuning_type.value)
+            assert _noop_gate_excused(
+                tuning_type.value, strip_pk, strip_fk, reg_pk, reg_fk, key in _NONE_JUSTIFICATION_OVERRIDES
+            ), (
+                f"{adapter_key}/{tuning_type.value} is registered not-rendered but the "
                 f"{adapter_cls.__name__} lifecycle shows no strip, no applied DDL-rewrite kind strip, "
                 f"and no documented justification; document it in _NONE_JUSTIFICATION_OVERRIDES or "
                 f"correct the registry"
             )
 
-    def test_unique_check_rendering_is_vacuous_in_tree(self) -> None:
-        from benchbox.clickbench import ClickBenchBenchmark
-        from benchbox.coffeeshop import CoffeeShopBenchmark
-        from benchbox.joinorder import JoinOrderBenchmark
-        from benchbox.ssb import SSBBenchmark
-        from benchbox.tpcds import TPCDSBenchmark
-        from benchbox.tpch import TPCHBenchmark
+    def test_alias_adapters_are_parity_targets(self) -> None:
+        for alias, target in PLATFORM_ALIASES.items():
+            if target not in known_registry_platforms():
+                continue
+            alias_cls = _adapter_class(resolve_platform_key(alias))
+            target_cls = _adapter_class(resolve_platform_key(target))
+            if alias_cls is None or target_cls is None or alias_cls is target_cls:
+                continue
+            assert _PARITY_ALIAS_TARGETS.get(alias) == target, (
+                f"alias '{alias}' resolves to a distinct adapter class ({alias_cls.__name__} vs "
+                f"{target_cls.__name__}) but has no parity target; add it to _PARITY_ALIAS_TARGETS"
+            )
 
-        benchmarks = [
-            TPCHBenchmark(),
-            TPCDSBenchmark(),
-            SSBBenchmark(),
-            JoinOrderBenchmark(),
-            CoffeeShopBenchmark(),
-            ClickBenchBenchmark(),
-        ]
-        for benchmark in benchmarks:
+    def test_rendered_gate_rejects_signal_only_claims(self) -> None:
+        assert not _rendered_gate_passes(True, True, False, False)
+        assert not _rendered_gate_passes(True, False, True, False)
+        assert not _rendered_gate_passes(False, True, True, False)
+        assert _rendered_gate_passes(True, True, True, False)
+        assert _rendered_gate_passes(False, False, False, True)
+
+    def test_noop_gate_requires_matching_kind(self) -> None:
+        assert _noop_gate_excused("primary_keys", True, False, False, False, False)
+        assert _noop_gate_excused("primary_keys", False, False, True, False, False)
+        assert _noop_gate_excused("foreign_keys", False, True, False, False, False)
+        assert _noop_gate_excused("foreign_keys", False, False, False, True, False)
+        assert not _noop_gate_excused("partitioning", True, True, True, True, False)
+        assert not _noop_gate_excused("primary_keys", False, True, False, True, False)
+        assert not _noop_gate_excused("foreign_keys", True, False, True, False, False)
+        assert _noop_gate_excused("partitioning", False, False, False, False, True)
+
+    def test_unique_check_rendering_is_vacuous_in_tree(self) -> None:
+        for module_name, class_name, benchmark in _vacuous_capable_benchmarks():
             plain = UnifiedTuningConfiguration()
             plain.disable_all_constraints()
             toggled = UnifiedTuningConfiguration()
@@ -1207,9 +1618,42 @@ class TestRegistryExecutionParity:
             assert benchmark.get_create_tables_sql(tuning_config=plain) == benchmark.get_create_tables_sql(
                 tuning_config=toggled
             ), (
-                f"{type(benchmark).__name__} DDL now varies with UNIQUE/CHECK flags; the rendered "
-                "UNIQUE/CHECK registry claims (accepted as renders-if-declared engine capability) "
-                "must be re-audited against execution"
+                f"{module_name}.{class_name} DDL now varies with UNIQUE/CHECK flags; the not-rendered "
+                "UNIQUE/CHECK registry entries must be re-audited against execution"
+            )
+
+    def test_benchmark_ddl_ignores_layout_flags_in_tree(self) -> None:
+        for module_name, class_name, benchmark in _vacuous_capable_benchmarks():
+            plain = UnifiedTuningConfiguration()
+            plain.disable_all_constraints()
+            toggled = UnifiedTuningConfiguration()
+            toggled.disable_all_constraints()
+            toggled.table_tunings["orders"] = TableTuning(
+                table_name="orders",
+                partitioning=[TuningColumn(name="o_orderdate", type="DATE", order=1)],
+                sorting=[TuningColumn(name="o_orderkey", type="INTEGER", order=1)],
+                clustering=[TuningColumn(name="o_orderkey", type="INTEGER", order=1)],
+                distribution=[TuningColumn(name="o_orderkey", type="INTEGER", order=1)],
+            )
+            assert benchmark.get_create_tables_sql(tuning_config=plain) == benchmark.get_create_tables_sql(
+                tuning_config=toggled
+            ), (
+                f"{module_name}.{class_name} DDL now varies with layout tuning flags; the not-rendered "
+                "layout registry entries must be re-audited against execution"
+            )
+
+    def test_vacuity_discovery_covers_all_benchmarks(self) -> None:
+        found = {(module_name, class_name) for module_name, class_name, _ in _discovered_benchmarks()}
+        assert found, "benchmark discovery is empty; the vacuity proof covers nothing"
+        for key in _VACUITY_SIGNATURE_ONLY:
+            assert key in found, f"signature-only benchmark {key} disappeared from discovery"
+        for module_name, class_name in sorted(found - set(_VACUITY_SIGNATURE_ONLY)):
+            assert any(
+                module_name == seen_module and class_name == seen_class
+                for seen_module, seen_class, _ in _vacuous_capable_benchmarks()
+            ), (
+                f"{module_name}.{class_name} is not covered by the vacuity proof; construct it in "
+                "_vacuous_capable_benchmarks or classify it in _VACUITY_SIGNATURE_ONLY"
             )
 
     def test_rendered_overrides_cover_only_current_entries(self) -> None:
@@ -1269,6 +1713,193 @@ class TestRegistryExecutionParity:
                     for bound in number:
                         if bound:
                             assert int(bound) <= total, f"{key}: cited line out of range in {match}"
+
+    def test_noop_justifications_are_machine_backed(self) -> None:
+        signals_by_platform = {}
+        for platform_key in known_registry_platforms():
+            adapter_cls = _adapter_class(resolve_platform_key(platform_key))
+            assert adapter_cls is not None
+            bodies = _reachable_bodies(adapter_cls, _PLATFORM_SKIP_MODULES.get(platform_key, frozenset()))
+            _tuning_read, _sql_exec, _ddl_handoff, strip_pk, strip_fk, texts = _signals(bodies)
+            reg_pk, reg_fk = _registered_kind_strips(platform_key)
+            signals_by_platform[platform_key] = (strip_pk, strip_fk, reg_pk, reg_fk, texts)
+        for key, reason in _NONE_JUSTIFICATION_OVERRIDES.items():
+            platform_key, tuning_value = key
+            assert self._justification_backed(key, reason, signals_by_platform), (
+                f"{key}: justification has no machine-checked backing; add the key to a backing set "
+                f"(_UNCALLED_GENERATOR_KEYS, _RETURNS_EMPTY_GENERATOR_KEYS, _ABSENCE_CLAIMS, "
+                f"_BEHAVIORAL_STRIP_TESTS, _NO_TUNING_INPUT_TESTS, _DROPS_TUNING_TESTS, "
+                f"_IGNORES_TUNING_METHODS, _SCHEMA_IGNORES_CONSTRAINTS_TESTS, "
+                f"_GENERATOR_QUIET_FIELDS, _DATABEND_QUIET_KINDS, _LAYOUT_QUIET) or correct the registry"
+            )
+
+    def _justification_backed(
+        self,
+        key: tuple[str, str],
+        reason: str,
+        signals_by_platform: dict[str, tuple[bool, bool, bool, bool, list[str]]],
+    ) -> bool:
+        platform_key, tuning_value = key
+        if key in _UNCALLED_GENERATOR_KEYS or key in _RETURNS_EMPTY_GENERATOR_KEYS:
+            return True
+        if key in _ABSENCE_CLAIMS:
+            return True
+        for mapping in (
+            _BEHAVIORAL_STRIP_TESTS,
+            _NO_TUNING_INPUT_TESTS,
+            _DROPS_TUNING_TESTS,
+            _SCHEMA_IGNORES_CONSTRAINTS_TESTS,
+        ):
+            if key in mapping:
+                return callable(getattr(type(self), mapping[key], None))
+        if platform_key == "databend" and tuning_value in _DATABEND_QUIET_KINDS:
+            return callable(getattr(type(self), "test_databend_generate_ignores_non_clustering", None))
+        if key in _IGNORES_TUNING_METHODS:
+            return callable(getattr(type(self), _IGNORES_TUNING_METHODS[key], None))
+        if key in _GENERATOR_QUIET_FIELDS:
+            return callable(getattr(type(self), "test_quiet_generators_emit_no_clause", None))
+        if tuning_value in ("primary_keys", "foreign_keys"):
+            strip_pk, strip_fk, reg_pk, reg_fk, _texts = signals_by_platform[platform_key]
+            return _noop_gate_excused(tuning_value, strip_pk, strip_fk, reg_pk, reg_fk, False)
+        if tuning_value in ("unique_constraints", "check_constraints"):
+            strip_pk, strip_fk, _reg_pk, _reg_fk, texts = signals_by_platform[platform_key]
+            kinds = {kind for kind, _ in _applied_kind_strip_rules(platform_key)}
+            return (
+                _VACUITY_TEST_NAME in reason
+                and tuning_value not in kinds
+                and not _type_evidenced(tuning_value, texts, False, strip_pk, strip_fk)
+            )
+        if key in _LAYOUT_QUIET:
+            _strip_pk, _strip_fk, _reg_pk, _reg_fk, texts = signals_by_platform[platform_key]
+            return not _type_evidenced(tuning_value, texts, False, False, False)
+        return False
+
+    def test_questdb_create_schema_strips_constraints(self) -> None:
+        from benchbox.platforms.base.ddl_helpers import strip_foreign_keys
+        from benchbox.platforms.questdb import QuestDBAdapter
+
+        adapter = QuestDBAdapter.__new__(QuestDBAdapter)
+        create = "CREATE TABLE orders (o_orderkey INTEGER, o_custkey INTEGER, PRIMARY KEY (o_orderkey));"
+        assert "PRIMARY KEY" not in QuestDBAdapter._strip_pk_constraints(adapter, create)
+        assert "o_orderkey INTEGER" in QuestDBAdapter._strip_pk_constraints(adapter, create)
+        foreign = "CREATE TABLE orders (o_orderkey INTEGER, FOREIGN KEY (o_orderkey) REFERENCES c (x));"
+        assert "FOREIGN KEY" not in strip_foreign_keys(foreign)
+
+    def test_trino_base_optimize_strips_primary_keys(self) -> None:
+        from benchbox.platforms.presto_trino_adapter_base import PrestoTrinoAdapterBase
+
+        adapter = PrestoTrinoAdapterBase.__new__(PrestoTrinoAdapterBase)
+        adapter.table_format = "hive"
+        adapter.catalog = "catalog"
+        create = "CREATE TABLE orders (o_orderkey INTEGER, PRIMARY KEY (o_orderkey));"
+        assert "PRIMARY KEY" not in PrestoTrinoAdapterBase._optimize_table_definition(adapter, create)
+        foreign = "CREATE TABLE orders (o_orderkey INTEGER, FOREIGN KEY (o_orderkey) REFERENCES c (x));"
+        assert "FOREIGN KEY" in PrestoTrinoAdapterBase._optimize_table_definition(adapter, foreign)
+
+    def test_clickhouse_optimize_preserves_foreign_keys(self) -> None:
+        from benchbox.platforms.clickhouse.workload import ClickHouseWorkloadMixin
+
+        mixin = ClickHouseWorkloadMixin.__new__(ClickHouseWorkloadMixin)
+        create = (
+            "CREATE TABLE orders (o_orderkey INTEGER, FOREIGN KEY (o_orderkey) REFERENCES c (x)) "
+            "ENGINE = MergeTree() ORDER BY tuple();"
+        )
+        assert "FOREIGN KEY" in ClickHouseWorkloadMixin._optimize_table_definition(mixin, create, None)
+
+    def test_azure_synapse_optimize_uses_engine_default(self) -> None:
+        from benchbox.platforms.azure_synapse import AzureSynapseAdapter
+
+        adapter = AzureSynapseAdapter.__new__(AzureSynapseAdapter)
+        adapter.schema = "dbo"
+        adapter.distribution_default = "ROUND_ROBIN"
+        create = "CREATE TABLE orders (o_orderkey INTEGER, tuned_dist INTEGER);"
+        rendered = AzureSynapseAdapter._optimize_table_definition(adapter, create)
+        assert "DISTRIBUTION = ROUND_ROBIN" in rendered
+        assert "tuned_dist" not in rendered.split("WITH (DISTRIBUTION")[1]
+        assert "PARTITION" not in rendered.upper()
+
+    def test_athena_rewrite_takes_no_tuning(self) -> None:
+        from benchbox.platforms.athena import AthenaAdapter
+
+        parameters = inspect.signature(AthenaAdapter._convert_to_external_table).parameters
+        assert "tuning_config" not in parameters and "table_tuning" not in parameters
+        node = _mro_method_node(AthenaAdapter, "_convert_to_external_table")
+        assert node is not None
+        lowered = ast.unparse(node).lower()
+        assert "tuning_config" not in lowered and "table_tuning" not in lowered
+
+    def test_questdb_enhancement_takes_no_tuning(self) -> None:
+        from benchbox.platforms.questdb import QuestDBAdapter
+
+        parameters = inspect.signature(QuestDBAdapter._apply_questdb_schema_enhancements).parameters
+        assert "tuning_config" not in parameters and "table_tuning" not in parameters
+        adapter = QuestDBAdapter.__new__(QuestDBAdapter)
+        adapter.partition_by = None
+        create = "CREATE TABLE lineitem (l_orderkey INTEGER, l_shipdate DATE);"
+        rendered = QuestDBAdapter._apply_questdb_schema_enhancements(adapter, create)
+        assert "PARTITION BY MONTH" in rendered.upper()
+
+    def test_motherduck_create_schema_drops_tuning(self) -> None:
+        from benchbox.platforms.motherduck import MotherDuckAdapter
+
+        node = _mro_method_node(MotherDuckAdapter, "create_schema")
+        assert node is not None
+        lowered = ast.unparse(node).lower()
+        assert "tuning_config" not in lowered
+        assert "get_columns_by_type" not in lowered
+        reads = [
+            ast.unparse(child).lower()
+            for body in _reachable_bodies(MotherDuckAdapter)
+            for child in ast.walk(body)
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "get_columns_by_type"
+            and "clustering" in ast.unparse(child).lower()
+        ]
+        assert not reads, "motherduck CTAS path reads clustering columns"
+
+    def test_timescaledb_compression_ignores_tuning(self) -> None:
+        from benchbox.platforms.timescaledb import TimescaleDBAdapter
+
+        node = _mro_method_node(TimescaleDBAdapter, "_add_compression_policy")
+        assert node is not None
+        lowered = ast.unparse(node).lower()
+        assert "tuning_config" not in lowered
+        assert "table_tuning" not in lowered
+        assert "get_columns_by_type" not in lowered
+        assert "compress_orderby" not in lowered
+
+    def test_datafusion_schema_ignores_constraints(self) -> None:
+        from benchbox.platforms.datafusion import DataFusionAdapter
+
+        parameters = inspect.signature(DataFusionAdapter._get_benchmark_schema).parameters
+        assert "tuning_config" not in parameters and "enable_primary_keys" not in parameters
+        assert "enable_foreign_keys" not in parameters
+        node = _mro_method_node(DataFusionAdapter, "create_schema")
+        assert node is not None
+        lowered = ast.unparse(node).lower()
+        assert "does not enforce primary key or foreign key constraints" in lowered
+
+    def test_quiet_generators_emit_no_clause(self) -> None:
+        from benchbox.core.tuning.ddl_generator import get_ddl_generator
+
+        for (platform_key, tuning_value), field in sorted(_GENERATOR_QUIET_FIELDS.items()):
+            tuning: dict[str, list[TuningColumn]] = {
+                tuning_value: [TuningColumn(name="tuned_column", type="INTEGER", order=1)]
+            }
+            clauses = get_ddl_generator(platform_key).generate_tuning_clauses(TableTuning(table_name="t", **tuning))
+            assert getattr(clauses, field) is None, (
+                f"{platform_key}/{tuning_value} generator emits a {field} clause from tuned columns"
+            )
+
+    def test_databend_generate_ignores_non_clustering(self) -> None:
+        from benchbox.platforms.databend.adapter import DatabendAdapter
+
+        for tuning_value in sorted(_DATABEND_QUIET_KINDS):
+            tuning: dict[str, list[TuningColumn]] = {
+                tuning_value: [TuningColumn(name="tuned_column", type="INTEGER", order=1)]
+            }
+            assert DatabendAdapter.generate_tuning_clause(None, TableTuning(table_name="t", **tuning)) == ""
 
     def test_skip_set_is_empty(self) -> None:
         assert frozenset() == _SKIP_NO_ADAPTER_CLASS
@@ -1341,13 +1972,21 @@ class TestRegistryExecutionParity:
         assert ("foreign_keys", "singlestore_strip_foreign_keys") in matches
         assert not [kind for kind, _ in matches if kind == "primary_keys"]
 
+    def test_kind_strip_mapping_is_exact(self) -> None:
+        observed = {
+            (platform_key, kind, transformer)
+            for platform_key in known_registry_platforms()
+            for kind, transformer in _applied_kind_strip_rules(platform_key)
+        }
+        assert observed == {("singlestore", "foreign_keys", "singlestore_strip_foreign_keys")}, (
+            f"DDL_OPTIMIZE kind-strip mapping changed: {sorted(observed)}; re-audit the noop gate excuses"
+        )
+
     def test_gate_rejects_rewriting_adapters_unique_check(self) -> None:
         for platform_key in ("starrocks", "doris", "databend"):
             adapter_cls = _adapter_class(resolve_platform_key(platform_key))
             assert adapter_cls is not None
-            tuning_read, sql_exec, _strips, ddl_handoff, strip_pk, strip_fk, texts = _signals(
-                _reachable_bodies(adapter_cls)
-            )
+            tuning_read, sql_exec, ddl_handoff, strip_pk, strip_fk, texts = _signals(_reachable_bodies(adapter_cls))
             assert tuning_read and sql_exec and ddl_handoff
             assert strip_pk and strip_fk
             assert not _type_evidenced("unique_constraints", texts, ddl_handoff, strip_pk, strip_fk), platform_key
@@ -1360,6 +1999,15 @@ class TestRegistryExecutionParity:
         assert not _type_evidenced("auto_optimize", ["optimize the query plan"], True, False, False)
         assert not _type_evidenced("sorting", ["sorted_rows = sort_results(rows)"], True, False, False)
         assert _type_evidenced("sorting", ["sort key clause"], True, False, False)
+        assert not _type_evidenced("check_constraints", ["check the logs for errors"], True, False, False)
+        assert not _type_evidenced("sorting", ["rows arrive pre-sorted"], True, False, False)
+        assert not _type_evidenced("clustering", ["cluster status: healthy"], True, False, False)
+        assert not _type_evidenced("partitioning", ["partition count"], True, False, False)
+        assert not _type_evidenced("distribution", ["redistribute the load"], True, False, False)
+        assert not _type_evidenced("clustering", ["liquid_clustering_enabled = True"], True, False, False)
+        assert not _type_evidenced("sorting", ["calls apply_ctas_sort next"], True, False, False)
+        assert _type_evidenced("clustering", ["alter table t cluster by (c)"], True, False, False)
+        assert _type_evidenced("partitioning", ["partition by range (d)"], True, False, False)
 
     def test_mysql_evidence_rests_on_shared_wire_base(self) -> None:
         from benchbox.platforms.base.mysql_wire import MySqlWireLifecycleMixin, NoOpTableTuningMixin
@@ -1375,7 +2023,7 @@ class TestRegistryExecutionParity:
         assert bodies, "no shared-base lifecycle reachable for mysql"
         excluded = {ast.unparse(node) for node in full} - {ast.unparse(node) for node in bodies}
         assert excluded, "mysql skip set excludes no singlestore-defined lifecycle"
-        tuning_read, sql_exec, _strips, ddl_handoff, strip_pk, strip_fk, texts = _signals(bodies)
+        tuning_read, sql_exec, ddl_handoff, strip_pk, strip_fk, texts = _signals(bodies)
         assert tuning_read and sql_exec and ddl_handoff
         assert not strip_pk and not strip_fk
         for tuning_type, capability in PLATFORM_TUNING_CAPABILITIES["mysql"].items():
@@ -1414,6 +2062,11 @@ class TestRegistryExecutionParity:
         assert _exec_signal("def create_schema(self):\n    client.query(create_table_sql)\n")
         assert not _exec_signal("def probe(self):\n    client.query(select_sql)\n")
         assert not _exec_signal("def count(self):\n    return client.query(count_sql)\n")
+        assert not _exec_signal("def create_schema(self):\n    builder.query(create_table_sql)\n")
+        assert not _exec_signal("def create_schema(self):\n    self.preview.query(create_table_sql)\n")
+        assert not _exec_signal("def create_schema(self):\n    connection.query(preview)\n")
+        assert not _exec_signal("def create_schema(self):\n    connection.query(count_sql)\n")
+        assert _exec_signal("def create_schema(self):\n    self.connection.query(create_table_sql)\n")
 
     def test_pk_fk_flags_drive_ddl_content(self) -> None:
         from benchbox.ssb import SSBBenchmark

@@ -315,7 +315,7 @@ class TestTuningValidateSql:
 
         assert result.exit_code == 0, output
         assert "Configuration is valid for duckdb" in output
-        assert "Enabled tuning types: 4" in output
+        assert "Enabled tuning types: 3" in output
 
     def test_sql_validation_goes_through_validate_for_platform_detailed(self):
         template = REPO_ROOT / "examples/tunings/duckdb/tpch_tuned.yaml"

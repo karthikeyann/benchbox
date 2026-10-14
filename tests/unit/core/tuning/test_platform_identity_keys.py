@@ -148,10 +148,11 @@ class TestKnownPlatformSemanticsPreserved:
             for tuning_type in tuning_types:
                 assert tuning_type.is_compatible_with_platform(platform) is True
 
-    def test_duckdb_default_config_still_validates_clean(self):
+    def test_duckdb_default_config_errors_on_unrendered_constraints(self):
         config = UnifiedTuningConfiguration()
         errors, warnings = config.validate_for_platform_detailed("duckdb")
-        assert errors == []
+        assert any("requested unique_constraints is not applied at execution" in e for e in errors)
+        assert any("requested check_constraints is not applied at execution" in e for e in errors)
         assert warnings == []
 
     def test_layout_incompatibility_on_known_platform_still_errors(self):
@@ -178,8 +179,9 @@ class TestKnownPlatformSemanticsPreserved:
         config = UnifiedTuningConfiguration()
         errors, warnings = config.validate_for_platform_detailed("clickhouse")
         assert any("requested unique_constraints is not applied at execution" in e for e in errors)
-        assert any("'foreign_keys'" in w for w in warnings)
-        assert any("'check_constraints'" in w for w in warnings)
+        assert any("requested foreign_keys is not applied at execution" in e for e in errors)
+        assert any("requested check_constraints is not applied at execution" in e for e in errors)
+        assert warnings == []
 
     def test_databricks_liquid_layout_validation_still_errors(self):
         config = UnifiedTuningConfiguration()

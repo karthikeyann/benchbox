@@ -66,6 +66,7 @@ EXPECTED_PRE_REFACTOR_COMPATIBILITY_BASELINE_20260716: dict[str, frozenset[str]]
             "clustering",
             "primary_keys",
             "foreign_keys",
+            "unique_constraints",
             "check_constraints",
             "materialized_views",
         }
@@ -88,7 +89,9 @@ EXPECTED_PRE_REFACTOR_COMPATIBILITY_BASELINE_20260716: dict[str, frozenset[str]]
             "sorting",
             "clustering",
             "primary_keys",
+            "foreign_keys",
             "unique_constraints",
+            "check_constraints",
             "materialized_views",
         }
     ),
