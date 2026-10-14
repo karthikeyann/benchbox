@@ -2033,7 +2033,7 @@ class TestRegistryExecutionParity:
                 f"mysql/{tuning_type.value} lacks shared-base evidence"
             )
         singlestore_path = Path(__file__).resolve().parents[4] / "benchbox" / "platforms" / "singlestore.py"
-        module_tree = ast.parse(singlestore_path.read_text())
+        module_tree = ast.parse(singlestore_path.read_text(encoding="utf-8"))
         singlestore_defs = {
             (node.name, ast.unparse(node))
             for node in ast.walk(module_tree)
@@ -2106,7 +2106,7 @@ class TestShippedTemplatesValidateClean:
         templates = list_packaged_templates(platform)
         assert templates.get(platform), f"no packaged templates found for {platform}"
         for template_path in templates[platform]:
-            config = UnifiedTuningConfiguration.from_dict(yaml.safe_load(template_path.read_text()))
+            config = UnifiedTuningConfiguration.from_dict(yaml.safe_load(template_path.read_text(encoding="utf-8")))
             errors, _warnings = config.validate_for_platform_detailed(platform)
             assert errors == [], f"{template_path}: {errors}"
 
@@ -2119,7 +2119,7 @@ class TestShippedTemplatesValidateClean:
 
         target = tmp_path / f"{platform}_tuning.yaml"
         ConfigManager().create_sample_unified_tuning_config(target, platform)
-        config = UnifiedTuningConfiguration.from_dict(yaml.safe_load(target.read_text()))
+        config = UnifiedTuningConfiguration.from_dict(yaml.safe_load(target.read_text(encoding="utf-8")))
         errors, _warnings = config.validate_for_platform_detailed(platform)
         assert errors == [], f"sample for {platform}: {errors}"
 
