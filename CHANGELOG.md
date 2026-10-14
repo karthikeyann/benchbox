@@ -291,14 +291,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mismatched keys are recorded as failed ledger statements and warned. Result
   metadata reports the live tuned values for shuffle partitions and adaptive
   execution.
-- Tuning validation now rejects requested tuning the registry marks as not rendered
-  at execution (`rendered_via` none or preview-only), and unknown platforms with
-  registry coverage error on unsupported types like known platforms. The registry
-  corrects no-op surfaces (Postgres family, Doris, SingleStore, Databend, Starburst
-  via a Trino alias, MotherDuck, DataFusion, fabric-warehouse via a dedicated entry
-  replacing the false Databricks alias) and the sample and fallback configuration
-  builders only enable tuning the target platform renders. Layout tuning on BigQuery,
-  Redshift, Trino and Synapse now errors until their render items land.
+- Tuning validation now rejects tuning requests the platform cannot execute,
+  and platforms without tuning coverage error on unsupported types like
+  covered platforms. The registry corrects several platforms' coverage
+  (Postgres family, Doris, SingleStore, Databend, Starburst, MotherDuck,
+  DataFusion, and fabric-warehouse, which now has its own entry instead of
+  sharing Databricks'), and the sample and fallback configuration builders
+  only enable tuning the target platform supports. Layout tuning on
+  BigQuery, Redshift, Trino and Synapse now errors until their execution
+  support lands.
 - The Atom feed uses canonical `/blog/` self and entry links while retaining stable entry IDs for existing subscribers.
 - Deprecated option aliases now show their warning. The Polars `streaming`
   option, `--polars-streaming`, Dask `use_distributed`, pg-duckdb
