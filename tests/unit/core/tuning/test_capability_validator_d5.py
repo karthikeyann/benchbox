@@ -251,8 +251,6 @@ _TYPE_EVIDENCE_TOKENS = {
         "partition_by",
         "partitioned by",
         "partitioned_by",
-        "cluster by",
-        "cluster_by",
     ),
     "sorting": ("sort_key", "sortkey", "sort key", "ctas"),
     "clustering": ("cluster by", "cluster_by", "clustering"),
@@ -980,7 +978,14 @@ _PLATFORM_SKIP_MODULES: dict[str, frozenset[str]] = {
     "mysql": frozenset({"benchbox.platforms.singlestore"}),
 }
 
-_RENDERED_OVERRIDE_JUSTIFICATIONS: dict[tuple[str, str], str] = {}
+_RENDERED_OVERRIDE_JUSTIFICATIONS: dict[tuple[str, str], str] = {
+    (
+        "snowflake",
+        "partitioning",
+    ): "Snowflake has no partition clause; apply_table_tunings reads PARTITIONING columns and issues them "
+    "as ALTER TABLE ... CLUSTER BY when no clustering columns are set (snowflake.py: apply_table_tunings). "
+    "Clustering tokens no longer evidence partitioning, so this rendering is attested here.",
+}
 
 _NONE_JUSTIFICATION_OVERRIDES: dict[tuple[str, str], str] = {
     (
@@ -1474,7 +1479,26 @@ def _lifecycle_generator_calls(adapter_cls: type) -> dict[str, list[str]]:
 
 _VACUITY_SIGNATURE_ONLY: dict[tuple[str, str], str] = {
     ("tpcds_obt", "TPCDSOBT"): "get_create_tables_sql accepts no tuning_config",
+    ("core.joinorder.benchmark", "JoinOrderSchema"): "schema helper; get_create_tables_sql accepts no tuning_config",
 }
+
+
+_DISCOVERY_IMPORT_SKIPS: dict[str, str] = {}
+
+
+def _benchmark_classes_in(module: object, module_key: str, seen: set[int]) -> list[tuple[str, str, type]]:
+    found: list[tuple[str, str, type]] = []
+    for attribute in sorted(vars(module)):
+        value = vars(module)[attribute]
+        if (
+            inspect.isclass(value)
+            and hasattr(value, "get_create_tables_sql")
+            and value.__module__.split(".")[0] == "benchbox"
+            and id(value) not in seen
+        ):
+            seen.add(id(value))
+            found.append((module_key, attribute, value))
+    return found
 
 
 def _discovered_benchmarks() -> list[tuple[str, str, type]]:
@@ -1482,22 +1506,24 @@ def _discovered_benchmarks() -> list[tuple[str, str, type]]:
     import pkgutil
 
     import benchbox
+    import benchbox.core
 
     found: list[tuple[str, str, type]] = []
     seen: set[int] = set()
-    entries = sorted(pkgutil.iter_modules(benchbox.__path__), key=lambda entry: entry.name)
-    for module in entries:
+    for module in sorted(pkgutil.iter_modules(benchbox.__path__), key=lambda entry: entry.name):
         imported = importlib.import_module(f"benchbox.{module.name}")
-        for attribute in sorted(vars(imported)):
-            value = vars(imported)[attribute]
-            if (
-                inspect.isclass(value)
-                and hasattr(value, "get_create_tables_sql")
-                and value.__module__.split(".")[0] == "benchbox"
-                and id(value) not in seen
-            ):
-                seen.add(id(value))
-                found.append((module.name, attribute, value))
+        found.extend(_benchmark_classes_in(imported, module.name, seen))
+    failures: dict[str, str] = {}
+    for module in sorted(pkgutil.walk_packages(benchbox.core.__path__, "benchbox.core."), key=lambda e: e.name):
+        if module.name in _DISCOVERY_IMPORT_SKIPS:
+            continue
+        try:
+            imported = importlib.import_module(module.name)
+        except ImportError as exc:
+            failures[module.name] = str(exc)
+            continue
+        found.extend(_benchmark_classes_in(imported, module.name.removeprefix("benchbox."), seen))
+    assert not failures, f"benchbox.core modules failed to import; fix or list in _DISCOVERY_IMPORT_SKIPS: {failures}"
     return found
 
 
@@ -1645,6 +1671,14 @@ class TestRegistryExecutionParity:
     def test_vacuity_discovery_covers_all_benchmarks(self) -> None:
         found = {(module_name, class_name) for module_name, class_name, _ in _discovered_benchmarks()}
         assert found, "benchmark discovery is empty; the vacuity proof covers nothing"
+        known = {
+            ("tpch", "TPCH"),
+            ("tpcds", "TPCDS"),
+            ("ssb", "SSB"),
+            ("clickbench", "ClickBench"),
+            ("core.ai_primitives", "AIPrimitivesBenchmark"),
+        }
+        assert known <= found, f"discovery lost known benchmarks: {sorted(known - found)}"
         for key in _VACUITY_SIGNATURE_ONLY:
             assert key in found, f"signature-only benchmark {key} disappeared from discovery"
         for module_name, class_name in sorted(found - set(_VACUITY_SIGNATURE_ONLY)):
@@ -2000,6 +2034,12 @@ class TestRegistryExecutionParity:
         assert not _type_evidenced("sorting", ["sorted_rows = sort_results(rows)"], True, False, False)
         assert _type_evidenced("sorting", ["sort key clause"], True, False, False)
         assert not _type_evidenced("check_constraints", ["check the logs for errors"], True, False, False)
+
+    def test_clustering_alone_does_not_evidence_partitioning(self) -> None:
+        clustering_only = ["sql = f'alter table t cluster by (a)'", "cluster_by = table_tuning.clustering"]
+        assert _type_evidenced("clustering", clustering_only, False, False, False)
+        assert not _type_evidenced("partitioning", clustering_only, False, False, False)
+        assert _type_evidenced("partitioning", ["create table t (a int) partition by (a)"], False, False, False)
         assert not _type_evidenced("sorting", ["rows arrive pre-sorted"], True, False, False)
         assert not _type_evidenced("clustering", ["cluster status: healthy"], True, False, False)
         assert not _type_evidenced("partitioning", ["partition count"], True, False, False)
