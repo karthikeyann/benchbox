@@ -291,6 +291,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mismatched keys are recorded as failed ledger statements and warned. Result
   metadata reports the live tuned values for shuffle partitions and adaptive
   execution.
+- ClickHouse tuning introspection bounds table queries in SQL by ledger tables and measures snapshot truncation directly on raw query results.
 - The Atom feed uses canonical `/blog/` self and entry links while retaining stable entry IDs for existing subscribers.
 - Deprecated option aliases now show their warning. The Polars `streaming`
   option, `--polars-streaming`, Dask `use_distributed`, pg-duckdb
